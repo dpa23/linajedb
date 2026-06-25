@@ -2,6 +2,7 @@
 name = "db-tui"
 version = "0.1.0"
 edition = "2024"
+default-run = "db-tui"
 
 [dependencies]
 ratatui = "0.26"
