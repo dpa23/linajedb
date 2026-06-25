@@ -636,7 +636,8 @@ impl AppState {
                 self.form_fields.port = "3306".to_string();
                 self.form_fields.user = "root".to_string();
                 self.form_fields.pass = "".to_string();
-                self.form_fields.db_or_path = "-----".to_string();
+                // Leave blank = connect to the server, then pick a DB with 'd'.
+                self.form_fields.db_or_path = String::new();
             }
             ActiveEngine::PostgreSql => {
                 self.form_fields.host = "127.0.0.1".to_string();
@@ -677,27 +678,32 @@ impl AppState {
     }
 
     pub fn get_form_connection_config(&self) -> DbEngineConfig {
-        let host = &self.form_fields.host;
-        let port = &self.form_fields.port;
-        let user = &self.form_fields.user;
+        let host = self.form_fields.host.trim();
+        let port = self.form_fields.port.trim();
+        let user = self.form_fields.user.trim();
         let pass = &self.form_fields.pass;
-        let db = &self.form_fields.db_or_path;
+        // Treat the old "-----" placeholder (and whitespace) as "no database given".
+        let db_raw = self.form_fields.db_or_path.trim();
+        let db = if db_raw.chars().all(|c| c == '-') { "" } else { db_raw };
 
         match self.active_engine {
             ActiveEngine::MariaDb => {
                 let credentials = if pass.is_empty() {
-                    user.clone()
+                    user.to_string()
                 } else {
                     format!("{}:{}", user, pass)
                 };
-                let db_part = if db.is_empty() { "mysql" } else { db };
-                DbEngineConfig::MariaDb {
-                    url: format!("mysql://{}@{}:{}/{}", credentials, host, port, db_part),
-                }
+                // No DB given -> connect to the server (no /db); pick one with 'd'.
+                let url = if db.is_empty() {
+                    format!("mysql://{}@{}:{}", credentials, host, port)
+                } else {
+                    format!("mysql://{}@{}:{}/{}", credentials, host, port, db)
+                };
+                DbEngineConfig::MariaDb { url }
             }
             ActiveEngine::PostgreSql => {
                 let credentials = if pass.is_empty() {
-                    user.clone()
+                    user.to_string()
                 } else {
                     format!("{}:{}", user, pass)
                 };
@@ -707,7 +713,7 @@ impl AppState {
                 }
             }
             ActiveEngine::Sqlite => DbEngineConfig::Sqlite {
-                path: db.clone(),
+                path: db_raw.to_string(),
             },
             ActiveEngine::MongoDb => {
                 let url = if user.is_empty() {
@@ -725,12 +731,12 @@ impl AppState {
                 let url = format!("bolt://{}:{}", host, port);
                 DbEngineConfig::Neo4j {
                     url,
-                    user: user.clone(),
+                    user: user.to_string(),
                     pass: pass.clone(),
                 }
             }
             ActiveEngine::LocalJson => DbEngineConfig::LocalJson {
-                path: db.clone(),
+                path: db_raw.to_string(),
             },
         }
     }
