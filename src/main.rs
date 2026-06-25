@@ -200,7 +200,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     _ => {}
                 }
 
-                if state.connected && state.active_pane != ActivePane::SqlConsole && state.active_pane != ActivePane::ModalEditor && !state.show_delete_confirm {
+                if state.connected && state.active_pane != ActivePane::SqlConsole && state.active_pane != ActivePane::ModalEditor && !state.show_delete_confirm && !state.search_active && !state.show_describe {
                     match key.code {
                         KeyCode::Char('1') => {
                             state.active_pane = ActivePane::Sidebar;
@@ -562,49 +562,80 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             continue;
                         }
 
+                        // Describe/schema overlay: any of i/Esc/Enter closes it.
+                        if state.show_describe {
+                            match key.code {
+                                KeyCode::Char('i') | KeyCode::Char('I') | KeyCode::Esc | KeyCode::Enter => {
+                                    state.show_describe = false;
+                                }
+                                _ => {}
+                            }
+                            continue;
+                        }
+
+                        // In-grid searcher typing mode.
+                        if state.search_active {
+                            match key.code {
+                                KeyCode::Char(c) => {
+                                    state.search_query.push(c);
+                                    state.clamp_selection_to_visible();
+                                }
+                                KeyCode::Backspace => {
+                                    state.search_query.pop();
+                                    state.clamp_selection_to_visible();
+                                }
+                                KeyCode::Enter => {
+                                    // Keep the filter but leave typing mode.
+                                    state.search_active = false;
+                                }
+                                KeyCode::Esc => {
+                                    // Clear the filter entirely.
+                                    state.search_active = false;
+                                    state.search_query.clear();
+                                    state.clamp_selection_to_visible();
+                                }
+                                _ => {}
+                            }
+                            if let Some(req) = load_related_data_if_needed(&state) {
+                                let _ = app_tx.send(req).await;
+                            }
+                            continue;
+                        }
+
                         let is_dbf = state.active_engine == ActiveEngine::LocalJson && state.conn_fields.json_path.ends_with(".dbf");
+                        let is_document_view = (state.active_engine == ActiveEngine::MongoDb || state.active_engine == ActiveEngine::LocalJson) && !is_dbf;
                         match key.code {
+                            KeyCode::Char('/') => {
+                                if !is_document_view {
+                                    state.search_active = true;
+                                }
+                            }
+                            KeyCode::Char('i') | KeyCode::Char('I') => {
+                                state.toggle_describe();
+                            }
                             KeyCode::Up => {
-                                if (state.active_engine == ActiveEngine::MongoDb || state.active_engine == ActiveEngine::LocalJson) && !is_dbf {
+                                if is_document_view {
                                     if let Some(idx) = state.selected_tree_row_idx {
                                         if idx > 0 {
                                             state.selected_tree_row_idx = Some(idx - 1);
                                         }
                                     }
-                                } else {
-                                    let mut changed = false;
-                                    if let Some(idx) = state.selected_row_idx {
-                                        if idx > 0 {
-                                            state.selected_row_idx = Some(idx - 1);
-                                            changed = true;
-                                        }
-                                    }
-                                    if changed {
-                                        if let Some(req) = load_related_data_if_needed(&state) {
-                                            let _ = app_tx.send(req).await;
-                                        }
+                                } else if state.step_visible_selection(false) {
+                                    if let Some(req) = load_related_data_if_needed(&state) {
+                                        let _ = app_tx.send(req).await;
                                     }
                                 }
                             }
                             KeyCode::Down => {
-                                if (state.active_engine == ActiveEngine::MongoDb || state.active_engine == ActiveEngine::LocalJson) && !is_dbf {
+                                if is_document_view {
                                     if let Some(idx) = state.selected_tree_row_idx {
                                         if idx < state.flat_tree_rows.len() - 1 {
                                             state.selected_tree_row_idx = Some(idx + 1);
                                         }
                                     }
-                                } else {
-                                    let mut changed = false;
-                                    if let Some(idx) = state.selected_row_idx {
-                                        if idx < state.result_rows.len() - 1 {
-                                            state.selected_row_idx = Some(idx + 1);
-                                            changed = true;
-                                        }
-                                    }
-                                    if changed {
-                                        if let Some(req) = load_related_data_if_needed(&state) {
-                                            let _ = app_tx.send(req).await;
-                                        }
+                                } else if state.step_visible_selection(true) {
+                                    if let Some(req) = load_related_data_if_needed(&state) {
+                                        let _ = app_tx.send(req).await;
                                     }
                                 }
                             }
@@ -907,7 +938,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 }
                 Event::Mouse(mouse_event) => {
-                    if mouse_event.kind == crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left) {
+                    use crossterm::event::MouseEventKind;
+                    // Mouse wheel scrolls the focused list/grid.
+                    if matches!(mouse_event.kind, MouseEventKind::ScrollDown | MouseEventKind::ScrollUp) {
+                        let forward = mouse_event.kind == MouseEventKind::ScrollDown;
+                        let is_dbf = state.active_engine == ActiveEngine::LocalJson && state.conn_fields.json_path.ends_with(".dbf");
+                        let is_document_view = (state.active_engine == ActiveEngine::MongoDb || state.active_engine == ActiveEngine::LocalJson) && !is_dbf;
+                        match state.active_pane {
+                            ActivePane::Sidebar => {
+                                let len = if state.show_db_list { state.databases.len() } else { state.tables.len() };
+                                let cur = if state.show_db_list { &mut state.selected_db_idx } else { &mut state.selected_table_idx };
+                                if let Some(idx) = cur {
+                                    if forward { if *idx + 1 < len { *cur = Some(*idx + 1); } }
+                                    else if *idx > 0 { *cur = Some(*idx - 1); }
+                                }
+                            }
+                            ActivePane::QueryResults => {
+                                if is_document_view {
+                                    if let Some(idx) = state.selected_tree_row_idx {
+                                        if forward { if idx + 1 < state.flat_tree_rows.len() { state.selected_tree_row_idx = Some(idx + 1); } }
+                                        else if idx > 0 { state.selected_tree_row_idx = Some(idx - 1); }
+                                    }
+                                } else if state.step_visible_selection(forward) {
+                                    if let Some(req) = load_related_data_if_needed(&state) {
+                                        let _ = app_tx.send(req).await;
+                                    }
+                                }
+                            }
+                            ActivePane::RelatedDataGrid => {
+                                if !state.related_rows.is_empty() {
+                                    let cur = state.related_selected_row_idx.unwrap_or(0);
+                                    if forward { if cur + 1 < state.related_rows.len() { state.related_selected_row_idx = Some(cur + 1); } }
+                                    else if cur > 0 { state.related_selected_row_idx = Some(cur - 1); }
+                                }
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+                    if mouse_event.kind == MouseEventKind::Down(crossterm::event::MouseButton::Left) {
                         let col = mouse_event.column;
                         let row = mouse_event.row;
                         if let Some(req) = state.handle_mouse_click(col, row) {

@@ -121,7 +121,89 @@ pub fn draw_ui(f: &mut Frame, state: &mut AppState) {
         draw_row_editor_modal(f, size, state, &theme);
     } else if state.show_delete_confirm {
         draw_delete_confirm_modal(f, size, state, &theme);
+    } else if state.show_describe {
+        draw_describe_modal(f, size, state, &theme);
     }
+}
+
+fn draw_describe_modal(f: &mut Frame, container_area: Rect, state: &mut AppState, theme: &Theme) {
+    let modal_area = get_centered_rect(70, 75, container_area);
+    f.render_widget(Clear, modal_area);
+    state.rect_describe = Some(modal_area);
+
+    let table_label = state.active_table_name.clone().unwrap_or_else(|| "result set".to_string());
+    let pk_note = match &state.primary_key {
+        Some(pk) => format!("PK: {}", pk),
+        None => "PK: (none detected)".to_string(),
+    };
+    let block = get_pane_block(&format!(" DESCRIBE: {}  ·  {} ", table_label, pk_note), true, theme)
+        .bg(Color::Black);
+    f.render_widget(block.clone(), modal_area);
+    let inner = block.inner(modal_area);
+
+    if state.describe_rows.is_empty() {
+        let msg = Paragraph::new("\n  No columns to describe yet. Load a table first.")
+            .style(Style::default().fg(theme.text_secondary));
+        f.render_widget(msg, inner);
+        return;
+    }
+
+    let widths = [
+        Constraint::Length(4),       // #
+        Constraint::Percentage(34),  // Column
+        Constraint::Length(11),      // Type
+        Constraint::Percentage(28),  // Key/role
+        Constraint::Percentage(30),  // Sample
+    ];
+
+    let header = Row::new(
+        state.describe_headers.iter().map(|h| {
+            ratatui::widgets::Cell::from(format!(" {}", h))
+                .style(Style::default().fg(theme.header_fg).add_modifier(Modifier::BOLD))
+        }),
+    )
+    .height(1)
+    .bottom_margin(1)
+    .style(Style::default().bg(HEADER_BG));
+
+    let rows: Vec<Row> = state.describe_rows.iter().enumerate().map(|(i, r)| {
+        let key_role = r.get(3).cloned().unwrap_or_default();
+        let cells = r.iter().enumerate().map(|(c, val)| {
+            let style = if c == 3 && !key_role.is_empty() {
+                // Highlight PK/FK roles
+                if key_role.contains("PK") {
+                    Style::default().fg(theme.header_fg).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(theme.accent)
+                }
+            } else if c == 1 {
+                Style::default().fg(theme.text_primary).add_modifier(Modifier::BOLD)
+            } else if c == 2 {
+                Style::default().fg(theme.success)
+            } else {
+                Style::default().fg(theme.text_secondary)
+            };
+            ratatui::widgets::Cell::from(format!(" {}", val)).style(style)
+        });
+        let row = Row::new(cells).height(1);
+        if i % 2 == 1 { row.style(Style::default().bg(ZEBRA_BG)) } else { row }
+    }).collect();
+
+    let footer = format!(
+        "  {} columns  ·  press [i] / Esc to close",
+        state.describe_rows.len()
+    );
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(1)])
+        .split(inner);
+
+    let table = Table::new(rows, widths).header(header).block(Block::default());
+    f.render_widget(table, layout[0]);
+    f.render_widget(
+        Paragraph::new(footer).style(Style::default().fg(theme.border_inactive)),
+        layout[1],
+    );
 }
 
 fn draw_connection_screen(f: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) {
@@ -407,6 +489,7 @@ fn draw_workspace(f: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme
     if state.bi_mode_enabled && state.bi_chartable {
         state.rect_related_split = None;
         state.rect_data_view = None;
+        state.rect_query_bar = None;
         draw_bi_dashboard(f, workspace_layout[1], state, theme);
     } else {
         draw_data_details(f, workspace_layout[1], state, theme);
@@ -496,15 +579,84 @@ fn draw_sidebar(f: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) 
     }
 }
 
+// Subtle alternating-row (zebra) background for readability.
+const ZEBRA_BG: Color = Color::Rgb(40, 42, 54);
+const SELECTED_BG: Color = Color::Rgb(58, 62, 90);
+const HEADER_BG: Color = Color::Rgb(49, 50, 68);
+
+/// Render the always-visible "active query" bar above the data grid.
+fn draw_query_bar(f: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) {
+    state.rect_query_bar = Some(area);
+    let shown = if !state.last_executed_query.trim().is_empty() {
+        state.last_executed_query.clone()
+    } else if !state.sql_console_input.trim().is_empty() {
+        state.sql_console_input.clone()
+    } else {
+        "(no query yet — pick a table or type one in [2] SQL Console)".to_string()
+    };
+    let line = Line::from(vec![
+        Span::styled(" query ", Style::default().fg(Color::Black).bg(theme.accent).add_modifier(Modifier::BOLD)),
+        Span::raw(" "),
+        Span::styled(shown, Style::default().fg(theme.text_primary)),
+    ]);
+    f.render_widget(Paragraph::new(line), area);
+}
+
+/// Render the in-grid searcher bar (only when active or a filter is set).
+fn draw_search_bar(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme, match_count: usize, total: usize) {
+    let cursor = if state.search_active { "█" } else { "" };
+    let tag_style = if state.search_active {
+        Style::default().fg(Color::Black).bg(theme.header_fg).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Black).bg(theme.text_secondary).add_modifier(Modifier::BOLD)
+    };
+    let line = Line::from(vec![
+        Span::styled(" search / ", tag_style),
+        Span::raw(" "),
+        Span::styled(format!("{}{}", state.search_query, cursor), Style::default().fg(theme.header_fg)),
+        Span::styled(
+            format!("   {} / {} rows match", match_count, total),
+            Style::default().fg(theme.text_secondary),
+        ),
+        Span::styled("   (Esc clear)", Style::default().fg(theme.border_inactive)),
+    ]);
+    f.render_widget(Paragraph::new(line), area);
+}
+
 fn draw_main_details_grid(f: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme, block: Block<'static>) {
+    // Carve out: query bar (always) + optional search bar + the grid/tree itself.
+    let show_search = state.search_active || !state.search_query.is_empty();
+    let mut constraints = vec![Constraint::Length(1)];
+    if show_search {
+        constraints.push(Constraint::Length(1));
+    }
+    constraints.push(Constraint::Min(1));
+    let zones = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(area);
+    let query_zone = zones[0];
+    let (search_zone, grid_zone) = if show_search {
+        (Some(zones[1]), zones[2])
+    } else {
+        (None, zones[1])
+    };
+
+    draw_query_bar(f, query_zone, state, theme);
+    // The clickable data area is the grid zone, not the whole pane (keeps mouse aligned).
+    state.rect_data_view = Some(grid_zone);
+
     // If document engine (MongoDB/JSON), render as tree view
     let is_dbf = state.active_engine == ActiveEngine::LocalJson && state.conn_fields.json_path.ends_with(".dbf");
     if (state.active_engine == ActiveEngine::MongoDb || state.active_engine == ActiveEngine::LocalJson) && !is_dbf {
+        if let Some(sz) = search_zone {
+            draw_search_bar(f, sz, state, theme, state.flat_tree_rows.len(), state.flat_tree_rows.len());
+        }
         if state.flat_tree_rows.is_empty() {
             let empty_msg = Paragraph::new("\n  Query returned 0 documents / Execute a filter to list records.")
                 .block(block)
                 .style(Style::default().fg(theme.text_secondary));
-            f.render_widget(empty_msg, area);
+            f.render_widget(empty_msg, grid_zone);
             return;
         }
 
@@ -516,9 +668,9 @@ fn draw_main_details_grid(f: &mut Frame, area: Rect, state: &mut AppState, theme
                 let is_selected = state.selected_tree_row_idx == Some(idx);
                 let mut style = Style::default().fg(theme.text_primary);
                 if is_selected {
-                    style = style.bg(Color::Rgb(49, 50, 68)).fg(theme.border_active).add_modifier(Modifier::BOLD);
+                    style = style.bg(SELECTED_BG).fg(theme.border_active).add_modifier(Modifier::BOLD);
                 }
-                
+
                 let line_str = &row.display_text;
                 let spans = if line_str.contains(':') {
                     let parts: Vec<&str> = line_str.splitn(2, ':').collect();
@@ -538,70 +690,114 @@ fn draw_main_details_grid(f: &mut Frame, area: Rect, state: &mut AppState, theme
         let list = List::new(items).block(block);
         let mut list_state = ListState::default();
         list_state.select(state.selected_tree_row_idx);
-        f.render_stateful_widget(list, area, &mut list_state);
-    } else {
-        // Relational Grid/Table View
-        if state.result_rows.is_empty() {
-            let empty_msg = Paragraph::new("\n  No records found / Run a SELECT query to pull data.")
-                .block(block)
-                .style(Style::default().fg(theme.text_secondary));
-            f.render_widget(empty_msg, area);
-            return;
-        }
-
-        let total_cols = state.result_headers.len();
-        let offset = state.col_scroll_offset.min(total_cols);
-        let visible_headers = &state.result_headers[offset..];
-        
-        let max_visible_cols = (area.width / 18) as usize;
-        let max_visible_cols = max_visible_cols.max(1);
-        let visible_count = visible_headers.len().min(max_visible_cols);
-        let sliced_headers = &visible_headers[0..visible_count];
-        
-        let widths = vec![Constraint::Percentage(100 / visible_count.max(1) as u16); visible_count];
-
-        let header_cells = sliced_headers
-            .iter()
-            .map(|h| ratatui::widgets::Cell::from(h.as_str()).style(Style::default().fg(theme.header_fg).add_modifier(Modifier::BOLD)));
-        let header = Row::new(header_cells).height(1).bottom_margin(1);
-
-        let rows: Vec<Row> = state
-            .result_rows
-            .iter()
-            .enumerate()
-            .map(|(idx, row_cells)| {
-                let offset_cells = &row_cells[offset.min(row_cells.len())..];
-                let visible_cells = &offset_cells[0..visible_count.min(offset_cells.len())];
-                let cells = visible_cells.iter().map(|c| ratatui::widgets::Cell::from(c.as_str()).style(Style::default().fg(theme.text_primary)));
-                let is_selected = state.selected_row_idx == Some(idx);
-                let row = Row::new(cells).height(1);
-                if is_selected {
-                    row.style(Style::default().bg(Color::Rgb(49, 50, 68)).fg(theme.border_active).add_modifier(Modifier::BOLD))
-                } else {
-                    row
-                }
-            })
-            .collect();
-
-        let scroll_indicator = if total_cols > visible_count {
-            format!(" (Col {}/{} ◀/▶ to scroll)", offset + 1, total_cols)
-        } else {
-            "".to_string()
-        };
-        let focused_grid = state.active_pane == ActivePane::QueryResults;
-        let final_block = get_pane_block(&format!("DATA VIEW{}", scroll_indicator), focused_grid, theme);
-
-        let table = Table::new(rows, widths)
-            .header(header)
-            .block(final_block)
-            .highlight_style(Style::default().bg(Color::Rgb(49, 50, 68)))
-            .highlight_symbol(">> ");
-
-        let mut table_state = ratatui::widgets::TableState::default();
-        table_state.select(state.selected_row_idx);
-
-        f.render_stateful_widget(table, area, &mut table_state);
+        f.render_stateful_widget(list, grid_zone, &mut list_state);
+        return;
     }
+
+    // Relational Grid/Table View
+    if state.result_rows.is_empty() {
+        if let Some(sz) = search_zone {
+            draw_search_bar(f, sz, state, theme, 0, 0);
+        }
+        let empty_msg = Paragraph::new("\n  No records found / Run a SELECT query to pull data.")
+            .block(block)
+            .style(Style::default().fg(theme.text_secondary));
+        f.render_widget(empty_msg, grid_zone);
+        return;
+    }
+
+    let total_cols = state.result_headers.len();
+    let offset = state.col_scroll_offset.min(total_cols.saturating_sub(1));
+    let visible_headers = &state.result_headers[offset..];
+
+    let max_visible_cols = (grid_zone.width / 16).max(1) as usize;
+    let visible_count = visible_headers.len().min(max_visible_cols).max(1);
+    let sliced_headers = &visible_headers[0..visible_count.min(visible_headers.len())];
+
+    let widths = vec![Constraint::Percentage(100 / visible_count.max(1) as u16); visible_count];
+
+    let header_cells = sliced_headers.iter().map(|h| {
+        ratatui::widgets::Cell::from(format!(" {}", h))
+            .style(Style::default().fg(theme.header_fg).add_modifier(Modifier::BOLD))
+    });
+    let header = Row::new(header_cells)
+        .height(1)
+        .bottom_margin(1)
+        .style(Style::default().bg(HEADER_BG));
+
+    // Only build rows that pass the search filter; remember their original index
+    // so selection/highlight stays correct relative to `result_rows`.
+    let visible_indices = state.visible_row_indices();
+    let match_count = visible_indices.len();
+
+    if let Some(sz) = search_zone {
+        draw_search_bar(f, sz, state, theme, match_count, state.result_rows.len());
+    }
+
+    let rows: Vec<Row> = visible_indices
+        .iter()
+        .enumerate()
+        .map(|(vis_pos, &orig_idx)| {
+            let row_cells = &state.result_rows[orig_idx];
+            let start = offset.min(row_cells.len());
+            let offset_cells = &row_cells[start..];
+            let take = visible_count.min(offset_cells.len());
+            let is_selected = state.selected_row_idx == Some(orig_idx);
+            let cells = offset_cells[0..take].iter().map(|c| {
+                let cell_style = if c == "NULL" {
+                    Style::default().fg(theme.border_inactive).add_modifier(Modifier::ITALIC)
+                } else {
+                    Style::default().fg(theme.text_primary)
+                };
+                ratatui::widgets::Cell::from(format!(" {}", c)).style(cell_style)
+            });
+            let row = Row::new(cells).height(1);
+            if is_selected {
+                row.style(Style::default().bg(SELECTED_BG).add_modifier(Modifier::BOLD))
+            } else if vis_pos % 2 == 1 {
+                row.style(Style::default().bg(ZEBRA_BG))
+            } else {
+                row
+            }
+        })
+        .collect();
+
+    // Position of the selected row within the filtered list (for scroll-into-view).
+    let selected_vis_pos = state
+        .selected_row_idx
+        .and_then(|sel| visible_indices.iter().position(|&i| i == sel));
+
+    let col_indicator = if total_cols > visible_count {
+        format!(" · col {}-{}/{} ◀▶", offset + 1, offset + visible_count, total_cols)
+    } else {
+        String::new()
+    };
+    let row_indicator = match selected_vis_pos {
+        Some(p) => format!(" · row {}/{}", p + 1, match_count),
+        None => format!(" · {} rows", match_count),
+    };
+    let filter_indicator = if !state.search_query.is_empty() {
+        format!(" · filtered from {}", state.result_rows.len())
+    } else {
+        String::new()
+    };
+    let focused_grid = state.active_pane == ActivePane::QueryResults;
+    let final_block = get_pane_block(
+        &format!("DATA VIEW{}{}{}", row_indicator, col_indicator, filter_indicator),
+        focused_grid,
+        theme,
+    );
+
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(final_block)
+        .highlight_style(Style::default().bg(SELECTED_BG))
+        .highlight_symbol("▎");
+
+    let mut table_state = ratatui::widgets::TableState::default();
+    table_state.select(selected_vis_pos);
+
+    f.render_stateful_widget(table, grid_zone, &mut table_state);
 }
 
 fn draw_related_data_split(f: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) {
@@ -1057,14 +1253,37 @@ fn draw_footer_status(f: &mut Frame, area: Rect, state: &mut AppState, theme: &T
     let status_widget = Paragraph::new(active_db_indicator).style(status_style);
     f.render_widget(status_widget, bar_layout[0]);
 
-    // Right keyboard hotkeys legend
-    let bi_avail = if state.bi_chartable { " | F6: BI Chart" } else { "" };
-    let mut shortcut_text = format!("Ctrl+Q: Quit | Tab: Switch Pane | Esc: Selector | d: DBs | Enter: Run{}", bi_avail);
-    if state.active_pane == ActivePane::RelatedDataGrid {
-        shortcut_text = format!("Enter/G: Descend | Backspace: Back | {}", shortcut_text);
-    } else if !state.exploration_history.is_empty() {
-        shortcut_text = format!("Backspace: Back | {}", shortcut_text);
-    }
+    // Right keyboard hotkeys legend — contextual to the focused pane.
+    let shortcut_text = if state.search_active {
+        "type to filter · Enter: keep · Esc: clear".to_string()
+    } else {
+        match state.active_pane {
+            ActivePane::Sidebar => {
+                "↑↓: Move · Enter: Open · d: DBs · Tab: Next pane · Ctrl+Q: Quit".to_string()
+            }
+            ActivePane::SqlConsole => {
+                "type query · Enter: Run · Esc: Back · Tab: Next pane".to_string()
+            }
+            ActivePane::QueryResults => {
+                let mut s = String::from("↑↓: Rows · ◀▶: Cols · /: Search · i: Describe · e/a/d: Edit/Add/Del");
+                if state.bi_chartable {
+                    s.push_str(" · F6: BI");
+                }
+                if !state.exploration_history.is_empty() {
+                    s = format!("Backspace: Back · {}", s);
+                }
+                s
+            }
+            ActivePane::RelatedDataList => {
+                "↑↓: Joins · Enter/▶: Open · Backspace: Back · Esc: Grid".to_string()
+            }
+            ActivePane::RelatedDataGrid => {
+                "↑↓: Rows · Enter/G: Descend · Backspace: Back · ◀▶: Cols".to_string()
+            }
+            ActivePane::ModalEditor => "↑↓: Field · type value · Enter: Save · Esc: Cancel".to_string(),
+            ActivePane::EngineSelector => "F2/F3/F4: Mode · ◀▶: Engine · Enter: Connect".to_string(),
+        }
+    };
     let legend = Paragraph::new(shortcut_text)
         .alignment(ratatui::layout::Alignment::Right)
         .style(Style::default().fg(theme.text_secondary));

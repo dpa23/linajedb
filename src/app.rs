@@ -294,6 +294,14 @@ pub struct AppState {
     pub related_loading: bool,
     pub exploration_history: Vec<ExplorationState>,
 
+    // Searcher / Query bar / Describe (connector UX)
+    pub search_active: bool,           // true while typing in the in-grid searcher
+    pub search_query: String,          // current filter text (client-side substring match)
+    pub last_executed_query: String,   // query that produced the data currently shown
+    pub show_describe: bool,           // describe/schema overlay visible
+    pub describe_headers: Vec<String>, // describe table headers
+    pub describe_rows: Vec<Vec<String>>, // describe table rows
+
     // Interactive Modal Row Editors
     pub show_edit_modal: bool,
     pub show_add_modal: bool,
@@ -319,6 +327,8 @@ pub struct AppState {
     pub rect_related_split: Option<Rect>,
     pub rect_related_list: Option<Rect>,
     pub rect_related_grid: Option<Rect>,
+    pub rect_query_bar: Option<Rect>,
+    pub rect_describe: Option<Rect>,
 }
 
 impl AppState {
@@ -413,6 +423,12 @@ impl AppState {
             related_selected_row_idx: None,
             related_loading: false,
             exploration_history: vec![],
+            search_active: false,
+            search_query: String::new(),
+            last_executed_query: String::new(),
+            show_describe: false,
+            describe_headers: vec![],
+            describe_rows: vec![],
             show_edit_modal: false,
             show_add_modal: false,
             show_delete_confirm: false,
@@ -432,6 +448,8 @@ impl AppState {
             rect_related_split: None,
             rect_related_list: None,
             rect_related_grid: None,
+            rect_query_bar: None,
+            rect_describe: None,
         };
 
         app.load_discovered_profiles();
@@ -800,7 +818,12 @@ impl AppState {
                 self.result_rows = rows;
                 self.selected_row_idx = if !self.result_rows.is_empty() { Some(0) } else { None };
                 self.bi_mode_enabled = false;
-                
+                self.last_executed_query = self.sql_console_input.clone();
+                self.search_active = false;
+                self.search_query.clear();
+                self.col_scroll_offset = 0;
+                self.rebuild_describe();
+
                 let cols_ref = self.result_headers.clone();
                 let rows_ref = self.result_rows.clone();
                 self.parse_bi_data(&cols_ref, &rows_ref);
@@ -819,6 +842,7 @@ impl AppState {
                 self.relationships = relationships;
                 self.active_relationship_idx = 0;
                 self.related_col_scroll_offset = 0;
+                self.rebuild_describe();
             }
             DbResponse::RelatedData { columns, rows } => {
                 self.related_headers = columns;
@@ -835,6 +859,9 @@ impl AppState {
                 }
                 self.update_flat_tree();
                 self.selected_tree_row_idx = if !self.flat_tree_rows.is_empty() { Some(0) } else { None };
+                self.last_executed_query = self.sql_console_input.clone();
+                self.search_active = false;
+                self.search_query.clear();
             }
             DbResponse::Error(err) => {
                 self.conn_status_msg = format!("Error: {}", err);
@@ -1510,10 +1537,194 @@ impl AppState {
         ))
     }
 
+    // ---- Searcher (client-side row filter over the currently loaded grid) ----
+
+    /// Returns true if the given row matches the active search query (case-insensitive
+    /// substring on any cell). An empty query matches everything.
+    pub fn row_matches_search(&self, row: &[String]) -> bool {
+        if self.search_query.is_empty() {
+            return true;
+        }
+        let needle = self.search_query.to_lowercase();
+        row.iter().any(|cell| cell.to_lowercase().contains(&needle))
+    }
+
+    /// Indices into `result_rows` that are currently visible given the search filter.
+    pub fn visible_row_indices(&self) -> Vec<usize> {
+        self.result_rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| self.row_matches_search(row))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Move the grid selection to the previous/next *visible* row. Returns true if
+    /// the selection actually moved (so callers can refresh related data).
+    pub fn step_visible_selection(&mut self, forward: bool) -> bool {
+        let visible = self.visible_row_indices();
+        if visible.is_empty() {
+            self.selected_row_idx = None;
+            return false;
+        }
+        let current = self.selected_row_idx.unwrap_or(visible[0]);
+        // Position of current selection within the visible list (fallback to edge).
+        let pos = visible.iter().position(|&i| i == current);
+        let new_idx = match pos {
+            Some(p) if forward => {
+                if p + 1 < visible.len() { visible[p + 1] } else { return false; }
+            }
+            Some(p) => {
+                if p > 0 { visible[p - 1] } else { return false; }
+            }
+            None => visible[0],
+        };
+        if Some(new_idx) != self.selected_row_idx {
+            self.selected_row_idx = Some(new_idx);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Ensure the current selection points at a visible row (used after editing the filter).
+    pub fn clamp_selection_to_visible(&mut self) {
+        let visible = self.visible_row_indices();
+        if visible.is_empty() {
+            self.selected_row_idx = None;
+            return;
+        }
+        let still_visible = self
+            .selected_row_idx
+            .map(|i| visible.contains(&i))
+            .unwrap_or(false);
+        if !still_visible {
+            self.selected_row_idx = Some(visible[0]);
+        }
+    }
+
+    // ---- Describe / schema overlay ----
+
+    /// Best-effort column type inference from the sampled cell values.
+    fn infer_column_type(samples: &[&String]) -> &'static str {
+        let mut seen = false;
+        let mut all_int = true;
+        let mut all_num = true;
+        for s in samples {
+            let t = s.trim();
+            if t.is_empty() || t.eq_ignore_ascii_case("null") {
+                continue;
+            }
+            seen = true;
+            if t.parse::<i64>().is_err() {
+                all_int = false;
+            }
+            if t.parse::<f64>().is_err() {
+                all_num = false;
+            }
+        }
+        if !seen {
+            "empty/null"
+        } else if all_int {
+            "integer"
+        } else if all_num {
+            "decimal"
+        } else {
+            "text"
+        }
+    }
+
+    /// Rebuild the describe/schema table from the current headers, primary key,
+    /// relationships and a sample of the loaded rows. Does not hit the database.
+    pub fn rebuild_describe(&mut self) {
+        self.describe_headers = vec![
+            "#".to_string(),
+            "Column".to_string(),
+            "Type".to_string(),
+            "Key".to_string(),
+            "Sample".to_string(),
+        ];
+        self.describe_rows.clear();
+
+        let pk = self.primary_key.clone().unwrap_or_default();
+        let sample_limit = self.result_rows.len().min(25);
+
+        for (idx, header) in self.result_headers.iter().enumerate() {
+            let samples: Vec<&String> = self
+                .result_rows
+                .iter()
+                .take(sample_limit)
+                .filter_map(|r| r.get(idx))
+                .collect();
+            let ty = Self::infer_column_type(&samples);
+
+            let mut key_role = String::new();
+            if !pk.is_empty() && header.eq_ignore_ascii_case(&pk) {
+                key_role = "PK".to_string();
+            }
+            for rel in &self.relationships {
+                if rel.is_parent && rel.active_col.eq_ignore_ascii_case(header) {
+                    let fk = format!("FK→{}.{}", rel.target_table, rel.target_col);
+                    key_role = if key_role.is_empty() { fk } else { format!("{},{}", key_role, fk) };
+                }
+            }
+
+            let sample = samples
+                .iter()
+                .find(|s| {
+                    let t = s.trim();
+                    !t.is_empty() && !t.eq_ignore_ascii_case("null")
+                })
+                .map(|s| {
+                    let mut v = (*s).clone();
+                    if v.chars().count() > 24 {
+                        v = format!("{}…", v.chars().take(23).collect::<String>());
+                    }
+                    v
+                })
+                .unwrap_or_default();
+
+            self.describe_rows.push(vec![
+                (idx + 1).to_string(),
+                header.clone(),
+                ty.to_string(),
+                key_role,
+                sample,
+            ]);
+        }
+    }
+
+    pub fn toggle_describe(&mut self) {
+        if !self.show_describe {
+            self.rebuild_describe();
+        }
+        self.show_describe = !self.show_describe;
+    }
+
     pub fn handle_mouse_click(&mut self, col: u16, row: u16) -> Option<DbRequest> {
         let is_inside = |rect: Rect| -> bool {
             col >= rect.x && col < rect.x + rect.width && row >= rect.y && row < rect.y + rect.height
         };
+
+        // 0. Describe overlay swallows clicks; clicking outside closes it.
+        if self.show_describe {
+            if let Some(rect) = self.rect_describe {
+                if !is_inside(rect) {
+                    self.show_describe = false;
+                }
+            } else {
+                self.show_describe = false;
+            }
+            return None;
+        }
+
+        // 0b. Clicking the always-on query bar jumps to the SQL console.
+        if let Some(rect) = self.rect_query_bar {
+            if is_inside(rect) {
+                self.active_pane = ActivePane::SqlConsole;
+                return None;
+            }
+        }
 
         // 1. Header Tabs
         if let Some(rect) = self.rect_header_tabs {
@@ -1616,21 +1827,22 @@ impl AppState {
             if let Some(rect) = self.rect_data_view {
                 if is_inside(rect) {
                     self.active_pane = ActivePane::QueryResults;
-                    let header_offset = if self.active_engine == ActiveEngine::MongoDb || self.active_engine == ActiveEngine::LocalJson {
-                        0
-                    } else {
-                        2
-                    };
+                    let is_dbf = self.active_engine == ActiveEngine::LocalJson && self.conn_fields.json_path.ends_with(".dbf");
+                    let is_document_view = (self.active_engine == ActiveEngine::MongoDb || self.active_engine == ActiveEngine::LocalJson) && !is_dbf;
+                    // Account for the pane's top border + header row + header bottom-margin.
+                    let header_offset = if is_document_view { 1 } else { 3 };
                     let click_idx = row as i32 - rect.y as i32 - header_offset;
                     if click_idx >= 0 {
                         let click_idx = click_idx as usize;
-                        if self.active_engine == ActiveEngine::MongoDb || self.active_engine == ActiveEngine::LocalJson {
+                        if is_document_view {
                             if click_idx < self.flat_tree_rows.len() {
                                 self.selected_tree_row_idx = Some(click_idx);
                             }
                         } else {
-                            if click_idx < self.result_rows.len() {
-                                self.selected_row_idx = Some(click_idx);
+                            // Map the visible (filtered) position back to the real row index.
+                            let visible = self.visible_row_indices();
+                            if click_idx < visible.len() {
+                                self.selected_row_idx = Some(visible[click_idx]);
                             }
                         }
                     }
