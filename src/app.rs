@@ -119,6 +119,57 @@ pub enum ActivePane {
     ModalEditor,
 }
 
+/// Clickable on-screen buttons rendered in the action toolbar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolbarAction {
+    Search,
+    Describe,
+    Edit,
+    Add,
+    Delete,
+    Refresh,
+    ToggleChart,
+    ToggleRelated,
+    Databases,
+    Back,
+    Disconnect,
+}
+
+impl ToolbarAction {
+    /// (icon+label shown on the button, the keyboard shortcut hint).
+    pub fn label(&self) -> &'static str {
+        match self {
+            ToolbarAction::Search => "⌕ Search",
+            ToolbarAction::Describe => "≡ Describe",
+            ToolbarAction::Edit => "✎ Edit",
+            ToolbarAction::Add => "+ Add",
+            ToolbarAction::Delete => "✗ Delete",
+            ToolbarAction::Refresh => "⟲ Refresh",
+            ToolbarAction::ToggleChart => "▤ Chart",
+            ToolbarAction::ToggleRelated => "⮌ Related",
+            ToolbarAction::Databases => "🗁 DBs",
+            ToolbarAction::Back => "← Back",
+            ToolbarAction::Disconnect => "⏻ Disconnect",
+        }
+    }
+
+    pub fn shortcut(&self) -> &'static str {
+        match self {
+            ToolbarAction::Search => "/",
+            ToolbarAction::Describe => "i",
+            ToolbarAction::Edit => "e",
+            ToolbarAction::Add => "a",
+            ToolbarAction::Delete => "d",
+            ToolbarAction::Refresh => "r",
+            ToolbarAction::ToggleChart => "F6",
+            ToolbarAction::ToggleRelated => "F7",
+            ToolbarAction::Databases => "D",
+            ToolbarAction::Back => "⌫",
+            ToolbarAction::Disconnect => "Esc",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionMode {
     Profiles,
@@ -329,6 +380,8 @@ pub struct AppState {
     pub rect_related_grid: Option<Rect>,
     pub rect_query_bar: Option<Rect>,
     pub rect_describe: Option<Rect>,
+    // Clickable toolbar buttons: rebuilt every frame by the UI.
+    pub toolbar_buttons: Vec<(Rect, ToolbarAction)>,
 }
 
 impl AppState {
@@ -450,6 +503,7 @@ impl AppState {
             rect_related_grid: None,
             rect_query_bar: None,
             rect_describe: None,
+            toolbar_buttons: vec![],
         };
 
         app.load_discovered_profiles();
@@ -1701,6 +1755,104 @@ impl AppState {
         self.show_describe = !self.show_describe;
     }
 
+    /// Run a toolbar action (shared by mouse clicks and keyboard shortcuts).
+    /// Returns a DbRequest when the action needs the worker (e.g. refresh/back).
+    pub fn trigger_toolbar_action(&mut self, action: ToolbarAction) -> Option<DbRequest> {
+        match action {
+            ToolbarAction::Search => {
+                self.active_pane = ActivePane::QueryResults;
+                self.show_describe = false;
+                let is_dbf = self.active_engine == ActiveEngine::LocalJson && self.conn_fields.json_path.ends_with(".dbf");
+                let is_document_view = (self.active_engine == ActiveEngine::MongoDb || self.active_engine == ActiveEngine::LocalJson) && !is_dbf;
+                if !is_document_view {
+                    self.search_active = true;
+                }
+                None
+            }
+            ToolbarAction::Describe => {
+                self.active_pane = ActivePane::QueryResults;
+                self.toggle_describe();
+                None
+            }
+            ToolbarAction::Edit => {
+                self.active_pane = ActivePane::QueryResults;
+                self.open_edit_row_modal();
+                None
+            }
+            ToolbarAction::Add => {
+                self.active_pane = ActivePane::QueryResults;
+                self.open_add_row_modal();
+                None
+            }
+            ToolbarAction::Delete => {
+                self.active_pane = ActivePane::QueryResults;
+                if let Some(idx) = self.selected_row_idx {
+                    if idx < self.result_rows.len() {
+                        self.show_describe = false;
+                        self.show_delete_confirm = true;
+                        if let Some(ref pk_col) = self.primary_key {
+                            if let Some(pos) = self.result_headers.iter().position(|x| x.to_lowercase() == pk_col.to_lowercase()) {
+                                self.selected_row_pk_val = self.result_rows[idx].get(pos).cloned();
+                            }
+                        }
+                    }
+                }
+                None
+            }
+            ToolbarAction::Refresh => {
+                let q = if !self.last_executed_query.trim().is_empty() {
+                    self.last_executed_query.clone()
+                } else {
+                    self.sql_console_input.clone()
+                };
+                if q.trim().is_empty() {
+                    None
+                } else {
+                    self.connecting = true;
+                    Some(DbRequest::ExecuteQuery(q))
+                }
+            }
+            ToolbarAction::ToggleChart => {
+                if self.bi_chartable {
+                    self.bi_mode_enabled = !self.bi_mode_enabled;
+                    self.active_pane = ActivePane::QueryResults;
+                }
+                None
+            }
+            ToolbarAction::ToggleRelated => {
+                self.show_related_split = !self.show_related_split;
+                None
+            }
+            ToolbarAction::Databases => {
+                self.active_pane = ActivePane::Sidebar;
+                self.show_db_list = true;
+                self.connecting = true;
+                self.conn_status_msg = "Loading databases...".to_string();
+                Some(DbRequest::LoadDatabases)
+            }
+            ToolbarAction::Back => {
+                if let Some(prev) = self.exploration_history.pop() {
+                    self.active_table_name = prev.table_name.clone();
+                    self.sql_console_input = prev.query.clone();
+                    self.sql_cursor_pos = prev.query.len();
+                    self.active_relationship_idx = prev.active_relationship_idx;
+                    self.show_related_split = prev.show_related_split;
+                    self.active_pane = ActivePane::QueryResults;
+                    self.connecting = true;
+                    Some(DbRequest::ExecuteQuery(prev.query))
+                } else {
+                    None
+                }
+            }
+            ToolbarAction::Disconnect => {
+                self.connected = false;
+                self.active_pane = ActivePane::EngineSelector;
+                self.conn_status_msg = "Ready to connect".to_string();
+                None
+            }
+        }
+    }
+
     pub fn handle_mouse_click(&mut self, col: u16, row: u16) -> Option<DbRequest> {
         let is_inside = |rect: Rect| -> bool {
             col >= rect.x && col < rect.x + rect.width && row >= rect.y && row < rect.y + rect.height
@@ -1716,6 +1868,16 @@ impl AppState {
                 self.show_describe = false;
             }
             return None;
+        }
+
+        // 0a. Action toolbar buttons.
+        let hit = self
+            .toolbar_buttons
+            .iter()
+            .find(|(rect, _)| is_inside(*rect))
+            .map(|(_, action)| *action);
+        if let Some(action) = hit {
+            return self.trigger_toolbar_action(action);
         }
 
         // 0b. Clicking the always-on query bar jumps to the SQL console.

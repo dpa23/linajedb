@@ -1,4 +1,4 @@
-use crate::app::{ActiveEngine, ActivePane, AppState, BiChartType};
+use crate::app::{ActiveEngine, ActivePane, AppState, BiChartType, ToolbarAction};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
@@ -100,21 +100,23 @@ pub fn draw_ui(f: &mut Frame, state: &mut AppState) {
         return;
     }
 
-    // Normal Layout splits: Header (tabs), Main workspace (sidebar + data view), Footer (console + hotkeys)
+    // Normal Layout splits: Header (tabs), Action toolbar, Main workspace, Console, Footer
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3), // Header Tab Bar
-            Constraint::Min(10),   // Main View (Tables list + Data panel)
+            Constraint::Length(1), // Clickable action toolbar
+            Constraint::Min(8),    // Main View (Tables list + Data panel)
             Constraint::Length(3), // SQL input console
             Constraint::Length(1), // Footer status bar
         ])
         .split(size);
 
     draw_header_tabs(f, chunks[0], state, &theme);
-    draw_workspace(f, chunks[1], state, &theme);
-    draw_sql_console(f, chunks[2], state, &theme);
-    draw_footer_status(f, chunks[3], state, &theme);
+    draw_action_toolbar(f, chunks[1], state, &theme);
+    draw_workspace(f, chunks[2], state, &theme);
+    draw_sql_console(f, chunks[3], state, &theme);
+    draw_footer_status(f, chunks[4], state, &theme);
 
     // Draw modals if active
     if state.show_edit_modal || state.show_add_modal {
@@ -472,6 +474,69 @@ fn draw_header_tabs(f: &mut Frame, area: Rect, state: &mut AppState, theme: &The
         );
 
     f.render_widget(tabs, area);
+}
+
+/// A horizontal row of clickable action buttons. Each button registers its
+/// rect in `state.toolbar_buttons` so `handle_mouse_click` can dispatch it.
+fn draw_action_toolbar(f: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) {
+    state.toolbar_buttons.clear();
+
+    let is_relational = matches!(
+        state.active_engine,
+        ActiveEngine::MariaDb | ActiveEngine::PostgreSql | ActiveEngine::Sqlite
+    );
+
+    let mut actions: Vec<ToolbarAction> = vec![ToolbarAction::Search, ToolbarAction::Describe];
+    if is_relational {
+        actions.push(ToolbarAction::Edit);
+        actions.push(ToolbarAction::Add);
+        actions.push(ToolbarAction::Delete);
+    }
+    actions.push(ToolbarAction::Refresh);
+    if state.bi_chartable {
+        actions.push(ToolbarAction::ToggleChart);
+    }
+    if is_relational {
+        actions.push(ToolbarAction::ToggleRelated);
+    }
+    actions.push(ToolbarAction::Databases);
+    if !state.exploration_history.is_empty() {
+        actions.push(ToolbarAction::Back);
+    }
+    actions.push(ToolbarAction::Disconnect);
+
+    let mut spans: Vec<Span> = Vec::new();
+    let mut x = area.x;
+    for action in actions {
+        let text = format!(" {} {} ", action.label(), action.shortcut());
+        let w = text.chars().count() as u16;
+        if x + w + 1 >= area.x + area.width {
+            break; // ran out of horizontal space
+        }
+
+        // Danger actions get a red button; the chart toggle lights up when on.
+        let (bg, fg) = match action {
+            ToolbarAction::Delete | ToolbarAction::Disconnect => (theme.danger, Color::Black),
+            ToolbarAction::ToggleChart if state.bi_mode_enabled => (theme.success, Color::Black),
+            ToolbarAction::Back => (theme.header_fg, Color::Black),
+            _ => (theme.accent, Color::Black),
+        };
+        spans.push(Span::styled(
+            text,
+            Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::raw(" "));
+
+        state
+            .toolbar_buttons
+            .push((Rect { x, y: area.y, width: w, height: 1 }, action));
+        x += w + 1;
+    }
+
+    f.render_widget(
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(Color::Rgb(30, 31, 43))),
+        area,
+    );
 }
 
 fn draw_workspace(f: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) {

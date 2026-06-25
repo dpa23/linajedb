@@ -613,6 +613,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             KeyCode::Char('i') | KeyCode::Char('I') => {
                                 state.toggle_describe();
                             }
+                            KeyCode::Char('r') | KeyCode::Char('R') => {
+                                if let Some(req) = state.trigger_toolbar_action(app::ToolbarAction::Refresh) {
+                                    let _ = app_tx.send(req).await;
+                                    if let Some(ref table) = state.active_table_name {
+                                        let _ = app_tx.send(DbRequest::LoadMetadata { table: table.clone() }).await;
+                                    }
+                                }
+                            }
                             KeyCode::Up => {
                                 if is_document_view {
                                     if let Some(idx) = state.selected_tree_row_idx {
