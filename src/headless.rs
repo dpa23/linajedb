@@ -7,18 +7,28 @@ use crate::db::{DbEngineConfig, DbRequest, DbResponse, DbWorker, TraceKind, Trac
 use tokio::sync::mpsc;
 
 const USAGE: &str = "\
-Usage: db-tui trace --url <URL> --table <TABLE> --where <SQL-CONDITION> [--format json|tree]
+Usage: db-tui trace --url <URL> --table <TABLE> --where <CONDITION> [--format json|tree]
 
-Walks the foreign-key graph from one row in both directions (ancestors of
-ancestors, children of children) and prints the lineage.
+Walks the relationship graph from one row/document/node in both directions
+(ancestors of ancestors, children of children) and prints the lineage.
 
 Options:
-  --url <URL>        Connection URL: mysql://user:pass@host:port/db,
-                     postgres://user:pass@host:port/db, or a SQLite file path.
-  --table <TABLE>    Table the starting row lives in.
-  --where <COND>     SQL condition selecting the starting row, e.g. \"id=42\".
+  --url <URL>        mysql://user:pass@host:port/db
+                     postgres://user:pass@host:port/db
+                     mongodb://host:port/db  (db in the path is required)
+                     bolt://user:pass@host:port  (Neo4j)
+                     or a SQLite file path.
+  --table <TABLE>    Table (relational), collection (MongoDB) or node label
+                     (Neo4j) the starting point lives in.
+  --where <COND>     Relational: SQL condition, e.g. \"id=42\".
+                     MongoDB:    JSON filter, e.g. '{\"reference\": \"A-1\"}'.
+                     Neo4j:      prop=value, or a raw condition using n.
                      If it matches several rows, the first one is traced.
   --format <FMT>     json (default) or tree.
+
+Relational engines follow declared foreign keys; MongoDB infers references
+by naming convention (user_id / id_user / userId -> collection user(s));
+Neo4j follows real edges (outgoing = parents, incoming = children).
 
 Example:
   db-tui trace --url mysql://root:pw@127.0.0.1:3306/shop \\
@@ -61,15 +71,42 @@ fn parse_args(args: &[String]) -> Result<TraceArgs, String> {
     })
 }
 
-fn config_from_url(url: &str) -> DbEngineConfig {
+fn config_from_url(url: &str) -> Result<DbEngineConfig, String> {
     if url.starts_with("mysql://") {
-        DbEngineConfig::MariaDb { url: url.to_string() }
+        Ok(DbEngineConfig::MariaDb { url: url.to_string() })
     } else if url.starts_with("postgres://") || url.starts_with("postgresql://") {
-        DbEngineConfig::PostgreSql { url: url.to_string() }
+        Ok(DbEngineConfig::PostgreSql { url: url.to_string() })
+    } else if url.starts_with("mongodb://") || url.starts_with("mongodb+srv://") {
+        // The trace needs a concrete database: take it from the URL path.
+        let after_scheme = url.splitn(2, "://").nth(1).unwrap_or("");
+        let database = after_scheme
+            .splitn(2, '/')
+            .nth(1)
+            .map(|p| p.split('?').next().unwrap_or("").to_string())
+            .filter(|d| !d.is_empty())
+            .ok_or_else(|| {
+                format!("MongoDB URL must include the database: mongodb://host:port/db\n\n{}", USAGE)
+            })?;
+        Ok(DbEngineConfig::MongoDb { url: url.to_string(), database })
+    } else if url.starts_with("bolt://") || url.starts_with("neo4j://") {
+        // Credentials travel in the URL: bolt://user:pass@host:port
+        let (scheme, rest) = url.split_once("://").unwrap_or(("bolt", url));
+        let (user, pass, host) = match rest.rsplit_once('@') {
+            Some((creds, host)) => {
+                let (u, p) = creds.split_once(':').unwrap_or((creds, ""));
+                (u.to_string(), p.to_string(), host.to_string())
+            }
+            None => ("neo4j".to_string(), "neo4j".to_string(), rest.to_string()),
+        };
+        Ok(DbEngineConfig::Neo4j {
+            url: format!("{}://{}", scheme, host),
+            user,
+            pass,
+        })
     } else {
         // Anything else is treated as a SQLite file path.
         let path = url.strip_prefix("sqlite://").unwrap_or(url);
-        DbEngineConfig::Sqlite { path: path.to_string() }
+        Ok(DbEngineConfig::Sqlite { path: path.to_string() })
     }
 }
 
@@ -89,35 +126,16 @@ pub async fn run_trace(args: &[String]) -> Result<(), String> {
         async move { tx.send(req).await.map_err(|e| e.to_string()) }
     };
 
-    send(DbRequest::Connect(config_from_url(&args.url))).await?;
+    send(DbRequest::Connect(config_from_url(&args.url)?)).await?;
     match db_rx.recv().await {
         Some(DbResponse::Connected) => {}
         Some(DbResponse::Error(e)) => return Err(e),
         other => return Err(format!("unexpected response while connecting: {:?}", other)),
     }
 
-    let query = format!(
-        "SELECT * FROM {} WHERE {} LIMIT 1;",
-        args.table, args.condition
-    );
-    send(DbRequest::ExecuteQuery(query)).await?;
-    let (columns, rows) = match db_rx.recv().await {
-        Some(DbResponse::QueryResult { columns, rows }) => (columns, rows),
-        Some(DbResponse::Error(e)) => return Err(e),
-        other => return Err(format!("unexpected response while selecting the row: {:?}", other)),
-    };
-    // Empty results come back as a single "Status" pseudo-row.
-    if rows.is_empty() || (columns.len() == 1 && columns[0] == "Status") {
-        return Err(format!(
-            "no row in {} matches: {}",
-            args.table, args.condition
-        ));
-    }
-
-    send(DbRequest::TraceRow {
+    send(DbRequest::TraceStart {
         table: args.table,
-        columns,
-        values: rows[0].clone(),
+        condition: args.condition,
     })
     .await?;
     let root = match db_rx.recv().await {

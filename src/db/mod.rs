@@ -35,6 +35,11 @@ pub enum DbRequest {
     LoadMetadata { table: String },
     LoadRelatedData { relationship: RelationshipInfo, active_row_val: String },
     TraceRow { table: String, columns: Vec<String>, values: Vec<String> },
+    /// Engine-agnostic trace entry point (used by headless mode): find the
+    /// starting row/document/node from a condition, then walk its lineage.
+    /// `condition` is a SQL condition (relational), a JSON filter (MongoDB)
+    /// or a `prop=value` / raw `n.`-prefixed Cypher condition (Neo4j).
+    TraceStart { table: String, condition: String },
     LoadDatabases,
     SelectDatabase(String),
 }
@@ -181,6 +186,7 @@ impl DbWorker {
                 DbRequest::LoadMetadata { table } => self.handle_load_metadata(&table).await,
                 DbRequest::LoadRelatedData { relationship, active_row_val } => self.handle_load_related_data(relationship, active_row_val).await,
                 DbRequest::TraceRow { table, columns, values } => self.handle_trace_row(table, columns, values).await,
+                DbRequest::TraceStart { table, condition } => self.handle_trace_start(table, condition).await,
                 DbRequest::LoadDatabases => self.handle_load_databases().await,
                 DbRequest::SelectDatabase(db_name) => self.handle_select_database(db_name).await,
             };
@@ -448,6 +454,32 @@ impl DbWorker {
         }
     }
 
+    /// Resolve the starting point of a trace from a per-engine condition,
+    /// then walk its lineage with the walker matching the active engine.
+    async fn handle_trace_start(&self, table: String, condition: String) -> DbResponse {
+        match &self.connection {
+            ActiveConnection::None => DbResponse::Error("Not connected".to_string()),
+            ActiveConnection::MariaDb(_) | ActiveConnection::PostgreSql(_) | ActiveConnection::Sqlite(_) => {
+                let query = format!("SELECT * FROM {} WHERE {} LIMIT 1;", table, condition);
+                let (columns, rows) = match self.trace_select(&query).await {
+                    Ok(res) => res,
+                    Err(e) => return DbResponse::Error(e),
+                };
+                if rows.is_empty() || (columns.len() == 1 && columns[0] == "Status") {
+                    return DbResponse::Error(format!("no row in {} matches: {}", table, condition));
+                }
+                self.handle_trace_row(table, columns, rows.into_iter().next().unwrap()).await
+            }
+            ActiveConnection::MongoDb { client, database } => {
+                trace_mongo(client, database, &table, &condition).await
+            }
+            ActiveConnection::Neo4j(graph) => trace_neo4j(graph, &table, &condition).await,
+            ActiveConnection::LocalJson { .. } => DbResponse::Error(
+                "Row trace is not supported for local JSON files (no relations to follow)".to_string(),
+            ),
+        }
+    }
+
     /// Walk the FK graph in both directions from one row: ancestors
     /// (parents of parents, one row per FK) and descendants (children of
     /// children, a few rows per FK). Bounded by depth, rows-per-relation
@@ -458,10 +490,10 @@ impl DbWorker {
         columns: Vec<String>,
         values: Vec<String>,
     ) -> DbResponse {
-        const MAX_UP: usize = 4;       // ancestor depth
-        const MAX_DOWN: usize = 3;     // descendant depth
-        const ROWS_PER_REL: usize = 5; // child rows fetched per relation
-        const NODE_BUDGET: usize = 200;
+        const MAX_UP: usize = TRACE_MAX_UP;
+        const MAX_DOWN: usize = TRACE_MAX_DOWN;
+        const ROWS_PER_REL: usize = TRACE_ROWS_PER_REL;
+        const NODE_BUDGET: usize = TRACE_NODE_BUDGET;
 
         if let ActiveConnection::None = self.connection {
             return DbResponse::Error("Not connected".to_string());
@@ -666,6 +698,480 @@ impl DbWorker {
             other => other,
         }
     }
+}
+
+// Shared bounds for all trace walkers.
+const TRACE_MAX_UP: usize = 4;       // ancestor depth
+const TRACE_MAX_DOWN: usize = 3;     // descendant depth
+const TRACE_ROWS_PER_REL: usize = 5; // child rows fetched per relation
+const TRACE_NODE_BUDGET: usize = 200;
+
+fn bson_to_display(v: &bson::Bson) -> String {
+    match v {
+        bson::Bson::Null => "NULL".to_string(),
+        bson::Bson::String(s) => s.clone(),
+        bson::Bson::Int32(n) => n.to_string(),
+        bson::Bson::Int64(n) => n.to_string(),
+        bson::Bson::Double(n) => n.to_string(),
+        bson::Bson::Boolean(b) => b.to_string(),
+        bson::Bson::ObjectId(o) => o.to_hex(),
+        bson::Bson::DateTime(d) => d
+            .try_to_rfc3339_string()
+            .unwrap_or_else(|_| format!("{:?}", d)),
+        other => serde_json::to_string(&other.clone().into_relaxed_extjson())
+            .unwrap_or_else(|_| format!("{:?}", other)),
+    }
+}
+
+fn mongo_doc_fields(doc: &bson::Document) -> (Vec<String>, Vec<String>) {
+    let mut cols = Vec::new();
+    let mut vals = Vec::new();
+    for (k, v) in doc.iter() {
+        cols.push(k.clone());
+        vals.push(bson_to_display(v));
+    }
+    (cols, vals)
+}
+
+/// If a MongoDB field name looks like a reference by naming convention
+/// (`user_id`, `id_user`, `userId`), return the base name ("user").
+fn mongo_ref_base(field: &str) -> Option<String> {
+    let fl = field.to_lowercase();
+    if fl == "_id" || fl == "id" {
+        return None;
+    }
+    if let Some(b) = fl.strip_suffix("_id") {
+        return Some(b.to_string());
+    }
+    if let Some(b) = fl.strip_prefix("id_") {
+        return Some(b.to_string());
+    }
+    if field.ends_with("Id") && field.len() > 2 {
+        return Some(field[..field.len() - 2].to_lowercase());
+    }
+    None
+}
+
+/// Match a reference base name against the existing collections
+/// (exact, plural "s"/"es"), case-insensitively.
+fn mongo_find_collection(base: &str, collections: &[String]) -> Option<String> {
+    let cands = [base.to_string(), format!("{}s", base), format!("{}es", base)];
+    collections
+        .iter()
+        .find(|c| cands.iter().any(|k| c.eq_ignore_ascii_case(k)))
+        .cloned()
+}
+
+/// Candidate foreign-key field names that a child collection could use to
+/// reference `coll` (e.g. children of "users" may hold user_id / id_user / userId).
+fn mongo_child_field_candidates(coll: &str) -> Vec<String> {
+    let mut bases = vec![coll.to_lowercase()];
+    if let Some(b) = coll.to_lowercase().strip_suffix("es") {
+        bases.push(b.to_string());
+    }
+    if let Some(b) = coll.to_lowercase().strip_suffix('s') {
+        bases.push(b.to_string());
+    }
+    let mut fields = Vec::new();
+    for b in bases {
+        if b.is_empty() {
+            continue;
+        }
+        fields.push(format!("{}_id", b));
+        fields.push(format!("id_{}", b));
+        fields.push(format!("{}Id", b));
+    }
+    fields.sort();
+    fields.dedup();
+    fields
+}
+
+/// Equality variants for a Mongo id value: the value itself, plus the
+/// ObjectId/hex-string cross-representations children commonly store.
+fn mongo_id_variants(v: &bson::Bson) -> Vec<bson::Bson> {
+    let mut out = vec![v.clone()];
+    match v {
+        bson::Bson::ObjectId(o) => out.push(bson::Bson::String(o.to_hex())),
+        bson::Bson::String(s) => {
+            if let Ok(oid) = bson::oid::ObjectId::parse_str(s) {
+                out.push(bson::Bson::ObjectId(oid));
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// MongoDB lineage walker. Mongo has no declared FKs, so references are
+/// inferred by naming convention: fields like `user_id`/`id_user`/`userId`
+/// pointing at a collection `user(s)` are treated as parents, and other
+/// collections holding such a field equal to this document's _id as children.
+async fn trace_mongo(
+    client: &mongodb::Client,
+    database: &str,
+    collection: &str,
+    filter_str: &str,
+) -> DbResponse {
+    let collections = match nosql::list_mongodb_collections(client, database).await {
+        Ok(c) => c,
+        Err(e) => return DbResponse::Error(e.to_string()),
+    };
+
+    let start_filter = match nosql::parse_json_filter(filter_str) {
+        Ok(f) => f,
+        Err(e) => return DbResponse::Error(e),
+    };
+    let start_doc = match nosql::find_bson_docs(client, database, collection, start_filter, 1).await {
+        Ok(mut docs) if !docs.is_empty() => docs.remove(0),
+        Ok(_) => {
+            return DbResponse::Error(format!(
+                "no document in {} matches: {}",
+                collection, filter_str
+            ))
+        }
+        Err(e) => return DbResponse::Error(e),
+    };
+
+    let (cols, vals) = mongo_doc_fields(&start_doc);
+    let mut nodes: Vec<TraceNode> = vec![TraceNode {
+        kind: TraceKind::Root,
+        table: collection.to_string(),
+        via: String::new(),
+        columns: cols,
+        values: vals,
+        children: Vec::new(),
+        note: None,
+    }];
+    let mut kids: Vec<Vec<usize>> = vec![Vec::new()];
+    // Doc backing each arena node, for expansion.
+    let mut docs: Vec<(String, bson::Document)> = vec![(collection.to_string(), start_doc)];
+    let mut visited: HashSet<String> = HashSet::new();
+    if let Some(id) = docs[0].1.get("_id") {
+        visited.insert(format!("{}#{:?}", collection, id));
+    }
+
+    let mut queue: VecDeque<(usize, usize, bool)> = VecDeque::new();
+    queue.push_back((0, 0, true));
+    queue.push_back((0, 0, false));
+    let mut budget_hit = false;
+
+    while let Some((idx, depth, upward)) = queue.pop_front() {
+        let max_depth = if upward { TRACE_MAX_UP } else { TRACE_MAX_DOWN };
+        if depth >= max_depth {
+            nodes[idx].note.get_or_insert_with(|| "depth limit".to_string());
+            continue;
+        }
+        if nodes.len() >= TRACE_NODE_BUDGET {
+            budget_hit = true;
+            continue;
+        }
+        let (node_coll, node_doc) = docs[idx].clone();
+
+        if upward {
+            // Parents: reference-looking fields resolved against collections.
+            for (field, value) in node_doc.iter() {
+                if matches!(value, bson::Bson::Null) {
+                    continue;
+                }
+                let target = match mongo_ref_base(field).and_then(|b| mongo_find_collection(&b, &collections)) {
+                    Some(t) => t,
+                    None => continue,
+                };
+                let via = format!("{}.{} → {}._id", node_coll, field, target);
+                let or: Vec<bson::Document> = mongo_id_variants(value)
+                    .into_iter()
+                    .map(|v| bson::doc! { "_id": v })
+                    .collect();
+                let filter = bson::doc! { "$or": or };
+                match nosql::find_bson_docs(client, database, &target, filter, 1).await {
+                    Ok(found) => {
+                        for doc in found {
+                            let key = format!("{}#{:?}", target, doc.get("_id"));
+                            let cycle = !visited.insert(key);
+                            let (c, v) = mongo_doc_fields(&doc);
+                            nodes.push(TraceNode {
+                                kind: TraceKind::Parent,
+                                table: target.clone(),
+                                via: via.clone(),
+                                columns: if cycle { vec![] } else { c },
+                                values: if cycle { vec![] } else { v },
+                                children: vec![],
+                                note: cycle.then(|| "cycle: already traced".to_string()),
+                            });
+                            kids.push(Vec::new());
+                            docs.push((target.clone(), doc));
+                            let new_idx = nodes.len() - 1;
+                            kids[idx].push(new_idx);
+                            if !cycle {
+                                queue.push_back((new_idx, depth + 1, true));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        nodes.push(TraceNode {
+                            kind: TraceKind::Parent,
+                            table: target.clone(),
+                            via,
+                            columns: vec![],
+                            values: vec![],
+                            children: vec![],
+                            note: Some(format!("query error: {}", e)),
+                        });
+                        kids.push(Vec::new());
+                        docs.push((target.clone(), bson::Document::new()));
+                        let new_idx = nodes.len() - 1;
+                        kids[idx].push(new_idx);
+                    }
+                }
+            }
+        } else {
+            // Children: other collections holding a conventional FK field
+            // equal to this document's _id.
+            let id = match node_doc.get("_id") {
+                Some(v) => v.clone(),
+                None => continue,
+            };
+            let fields = mongo_child_field_candidates(&node_coll);
+            for child_coll in collections.iter().filter(|c| *c != &node_coll) {
+                if nodes.len() >= TRACE_NODE_BUDGET {
+                    budget_hit = true;
+                    break;
+                }
+                let mut or = Vec::new();
+                for f in &fields {
+                    for v in mongo_id_variants(&id) {
+                        or.push(bson::doc! { f.as_str(): v });
+                    }
+                }
+                let filter = bson::doc! { "$or": or };
+                let found = match nosql::find_bson_docs(
+                    client, database, child_coll, filter, (TRACE_ROWS_PER_REL + 1) as i64,
+                ).await {
+                    Ok(f) => f,
+                    Err(_) => continue, // collection not queryable: skip silently
+                };
+                let overflow = found.len() > TRACE_ROWS_PER_REL;
+                let found: Vec<_> = found.into_iter().take(TRACE_ROWS_PER_REL).collect();
+                let count = found.len();
+                for (i, doc) in found.into_iter().enumerate() {
+                    if nodes.len() >= TRACE_NODE_BUDGET {
+                        budget_hit = true;
+                        break;
+                    }
+                    let matched_field = fields
+                        .iter()
+                        .find(|f| doc.get(f.as_str()).is_some())
+                        .cloned()
+                        .unwrap_or_else(|| "?".to_string());
+                    let via = format!("{}.{} = {}._id", child_coll, matched_field, node_coll);
+                    let key = format!("{}#{:?}", child_coll, doc.get("_id"));
+                    let cycle = !visited.insert(key);
+                    let note = if cycle {
+                        Some("cycle: already traced".to_string())
+                    } else if overflow && i == count - 1 {
+                        Some("more documents exist (limit reached)".to_string())
+                    } else {
+                        None
+                    };
+                    let (c, v) = mongo_doc_fields(&doc);
+                    nodes.push(TraceNode {
+                        kind: TraceKind::Child,
+                        table: child_coll.clone(),
+                        via,
+                        columns: c,
+                        values: v,
+                        children: vec![],
+                        note,
+                    });
+                    kids.push(Vec::new());
+                    docs.push((child_coll.clone(), doc));
+                    let new_idx = nodes.len() - 1;
+                    kids[idx].push(new_idx);
+                    if !cycle {
+                        queue.push_back((new_idx, depth + 1, false));
+                    }
+                }
+            }
+        }
+    }
+
+    if budget_hit {
+        nodes[0].note.get_or_insert_with(|| {
+            format!("trace truncated at {} nodes", TRACE_NODE_BUDGET)
+        });
+    }
+    DbResponse::RowTrace(assemble_trace(0, &mut nodes, &kids))
+}
+
+fn neo4j_node_fields(node: &neo4rs::Node) -> (Vec<String>, Vec<String>) {
+    let mut cols = Vec::new();
+    let mut vals = Vec::new();
+    for k in node.keys() {
+        let v = node
+            .get::<String>(k)
+            .or_else(|_| node.get::<i64>(k).map(|n| n.to_string()))
+            .or_else(|_| node.get::<f64>(k).map(|n| n.to_string()))
+            .or_else(|_| node.get::<bool>(k).map(|b| b.to_string()))
+            .unwrap_or_else(|_| "[complex]".to_string());
+        cols.push(k.to_string());
+        vals.push(v);
+    }
+    (cols, vals)
+}
+
+fn neo4j_node_label(node: &neo4rs::Node) -> String {
+    node.labels().first().map(|s| s.to_string()).unwrap_or_else(|| "Node".to_string())
+}
+
+/// Neo4j lineage walker: the graph already has explicit edges, so "parents"
+/// are nodes reached by outgoing relationships and "children" by incoming ones.
+async fn trace_neo4j(graph: &neo4rs::Graph, label: &str, condition: &str) -> DbResponse {
+    // `prop=value` sugar, or a raw Cypher condition if it references `n.`.
+    let where_clause = if condition.contains("n.") {
+        condition.to_string()
+    } else {
+        match condition.split_once('=') {
+            Some((prop, val)) => {
+                let val = val.trim();
+                let lit = if val.parse::<f64>().is_ok() || val == "true" || val == "false" {
+                    val.to_string()
+                } else {
+                    format!("'{}'", val.trim_matches(|c| c == '\'' || c == '"').replace('\'', "\\'"))
+                };
+                format!("n.{} = {}", prop.trim(), lit)
+            }
+            None => return DbResponse::Error(
+                "Neo4j condition must be prop=value or a raw condition using n.".to_string(),
+            ),
+        }
+    };
+
+    let start_cy = format!("MATCH (n:`{}`) WHERE {} RETURN n LIMIT 1", label, where_clause);
+    let start = match graph.execute(neo4rs::query(&start_cy)).await {
+        Ok(mut stream) => match stream.next().await {
+            Ok(Some(row)) => match row.get::<neo4rs::Node>("n") {
+                Ok(node) => node,
+                Err(e) => return DbResponse::Error(format!("could not read start node: {}", e)),
+            },
+            Ok(None) => {
+                return DbResponse::Error(format!("no node :{} matches: {}", label, condition))
+            }
+            Err(e) => return DbResponse::Error(e.to_string()),
+        },
+        Err(e) => return DbResponse::Error(e.to_string()),
+    };
+
+    let (cols, vals) = neo4j_node_fields(&start);
+    let mut nodes: Vec<TraceNode> = vec![TraceNode {
+        kind: TraceKind::Root,
+        table: neo4j_node_label(&start),
+        via: String::new(),
+        columns: cols,
+        values: vals,
+        children: Vec::new(),
+        note: None,
+    }];
+    let mut kids: Vec<Vec<usize>> = vec![Vec::new()];
+    let mut graph_ids: Vec<i64> = vec![start.id()];
+    let mut visited: HashSet<i64> = HashSet::new();
+    visited.insert(start.id());
+
+    let mut queue: VecDeque<(usize, usize, bool)> = VecDeque::new();
+    queue.push_back((0, 0, true));
+    queue.push_back((0, 0, false));
+    let mut budget_hit = false;
+
+    while let Some((idx, depth, upward)) = queue.pop_front() {
+        let max_depth = if upward { TRACE_MAX_UP } else { TRACE_MAX_DOWN };
+        if depth >= max_depth {
+            nodes[idx].note.get_or_insert_with(|| "depth limit".to_string());
+            continue;
+        }
+        if nodes.len() >= TRACE_NODE_BUDGET {
+            budget_hit = true;
+            continue;
+        }
+
+        let this_id = graph_ids[idx];
+        let this_label = nodes[idx].table.clone();
+        let cy = if upward {
+            format!(
+                "MATCH (n)-[r]->(m) WHERE id(n) = {} RETURN type(r) AS rt, m LIMIT {}",
+                this_id,
+                TRACE_ROWS_PER_REL + 1
+            )
+        } else {
+            format!(
+                "MATCH (n)<-[r]-(m) WHERE id(n) = {} RETURN type(r) AS rt, m LIMIT {}",
+                this_id,
+                TRACE_ROWS_PER_REL + 1
+            )
+        };
+
+        let mut found: Vec<(String, neo4rs::Node)> = Vec::new();
+        match graph.execute(neo4rs::query(&cy)).await {
+            Ok(mut stream) => {
+                while let Ok(Some(row)) = stream.next().await {
+                    let rt = row.get::<String>("rt").unwrap_or_else(|_| "REL".to_string());
+                    if let Ok(m) = row.get::<neo4rs::Node>("m") {
+                        found.push((rt, m));
+                    }
+                }
+            }
+            Err(e) => {
+                nodes[idx].note.get_or_insert_with(|| format!("query error: {}", e));
+                continue;
+            }
+        }
+
+        let overflow = found.len() > TRACE_ROWS_PER_REL;
+        let found: Vec<_> = found.into_iter().take(TRACE_ROWS_PER_REL).collect();
+        let count = found.len();
+        for (i, (rel_type, m)) in found.into_iter().enumerate() {
+            if nodes.len() >= TRACE_NODE_BUDGET {
+                budget_hit = true;
+                break;
+            }
+            let m_label = neo4j_node_label(&m);
+            let via = if upward {
+                format!("(:{})-[:{}]->(:{})", this_label, rel_type, m_label)
+            } else {
+                format!("(:{})<-[:{}]-(:{})", this_label, rel_type, m_label)
+            };
+            let cycle = !visited.insert(m.id());
+            let note = if cycle {
+                Some("cycle: already traced".to_string())
+            } else if overflow && i == count - 1 {
+                Some("more nodes exist (limit reached)".to_string())
+            } else {
+                None
+            };
+            let (c, v) = neo4j_node_fields(&m);
+            nodes.push(TraceNode {
+                kind: if upward { TraceKind::Parent } else { TraceKind::Child },
+                table: m_label,
+                via,
+                columns: c,
+                values: v,
+                children: vec![],
+                note,
+            });
+            kids.push(Vec::new());
+            graph_ids.push(m.id());
+            let new_idx = nodes.len() - 1;
+            kids[idx].push(new_idx);
+            if !cycle {
+                queue.push_back((new_idx, depth + 1, upward));
+            }
+        }
+    }
+
+    if budget_hit {
+        nodes[0].note.get_or_insert_with(|| {
+            format!("trace truncated at {} nodes", TRACE_NODE_BUDGET)
+        });
+    }
+    DbResponse::RowTrace(assemble_trace(0, &mut nodes, &kids))
 }
 
 /// Rebuild the nested TraceNode tree from the flat arena produced by the walk.

@@ -24,6 +24,41 @@ pub async fn list_mongodb_collections(
     db.list_collection_names(None).await
 }
 
+pub fn parse_json_filter(filter_str: &str) -> Result<bson::Document, String> {
+    if filter_str.trim().is_empty() {
+        return Ok(bson::Document::new());
+    }
+    let json_val: Value = serde_json::from_str(filter_str)
+        .map_err(|e| format!("Invalid JSON filter: {}", e))?;
+    match bson::to_bson(&json_val) {
+        Ok(bson::Bson::Document(doc)) => Ok(doc),
+        _ => Err("Filter must be a valid JSON Object".to_string()),
+    }
+}
+
+/// Like `execute_mongodb_find` but keeps the raw BSON documents, so callers
+/// can reuse typed values (_id and friends) in follow-up queries.
+pub async fn find_bson_docs(
+    client: &Client,
+    database_name: &str,
+    collection_name: &str,
+    filter: bson::Document,
+    limit: i64,
+) -> Result<Vec<bson::Document>, String> {
+    let db = client.database(database_name);
+    let collection = db.collection::<bson::Document>(collection_name);
+    let find_options = mongodb::options::FindOptions::builder().limit(limit).build();
+    let mut cursor = collection
+        .find(filter, find_options)
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut results = Vec::new();
+    while let Some(doc) = cursor.try_next().await.map_err(|e| e.to_string())? {
+        results.push(doc);
+    }
+    Ok(results)
+}
+
 pub async fn execute_mongodb_find(
     client: &Client,
     database_name: &str,
@@ -35,16 +70,7 @@ pub async fn execute_mongodb_find(
     let collection = db.collection::<bson::Document>(collection_name);
 
     // Parse text input query to filter document
-    let filter_doc = if filter_str.trim().is_empty() {
-        bson::Document::new()
-    } else {
-        let json_val: Value = serde_json::from_str(filter_str)
-            .map_err(|e| format!("Invalid JSON filter: {}", e))?;
-        match bson::to_bson(&json_val) {
-            Ok(bson::Bson::Document(doc)) => doc,
-            _ => return Err("Filter must be a valid JSON Object".to_string()),
-        }
-    };
+    let filter_doc = parse_json_filter(filter_str)?;
 
     let find_options = mongodb::options::FindOptions::builder()
         .limit(limit)
