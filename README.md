@@ -1,20 +1,21 @@
 # linaje.db
 
-Multi-engine terminal database client with row lineage tracing: select any
-row and inspect its full ancestry (parents of parents) and descent (children
-of children) across foreign keys, inferred references, or graph edges. The
-lineage is available as an interactive tree, as JSON, and through a headless
-CLI designed for scripts and AI agents.
+Cliente de bases de datos para terminal, multi-motor, con trazado de linaje
+de filas: selecciona cualquier fila e inspecciona toda su ascendencia (padres
+de los padres) y descendencia (hijas de las hijas) a través de llaves
+foráneas, referencias inferidas o aristas de grafo. El linaje está disponible
+como árbol interactivo, como JSON y mediante una CLI headless diseñada para
+scripts y agentes de IA.
 
-Supported engines: MariaDB/MySQL, PostgreSQL, SQLite, MongoDB, Neo4j, and
-local JSON/BSON/DBF files.
+Motores soportados: MariaDB/MySQL, PostgreSQL, SQLite, MongoDB, Neo4j y
+archivos locales JSON/BSON/DBF.
 
-## Motivation
+## Motivación
 
-Answering "where does this row come from and what depends on it?" normally
-requires walking `INFORMATION_SCHEMA` by hand and running one query per
-foreign key. linaje.db performs the complete walk in a single step, in both
-directions, with cycle detection and bounded depth.
+Responder "¿de dónde viene esta fila y qué depende de ella?" normalmente
+exige recorrer `INFORMATION_SCHEMA` a mano y ejecutar una consulta por cada
+llave foránea. linaje.db realiza el recorrido completo en un solo paso, en
+ambas direcciones, con detección de ciclos y profundidad acotada.
 
 ```
 ● borrador  id_borrador=1, descripcion=PAGO 1ERA QUINCENA..., id_tipo=4, ...
@@ -27,23 +28,23 @@ directions, with cycle detection and bounded depth.
 └─▼ tesoreria (tesoreria.id_borrador = borrador.id_borrador)  ...
 ```
 
-## Architecture
+## Arquitectura
 
-The UI never blocks on the database: a worker task owns every connection and
-communicates with the interface through channels. The same worker serves the
-TUI and the headless CLI.
+La interfaz nunca se bloquea esperando a la base de datos: una tarea worker
+es dueña de cada conexión y se comunica con la interfaz por canales. El mismo
+worker atiende al TUI y a la CLI headless.
 
 ```mermaid
 flowchart LR
-    subgraph Interface
-        TUI[TUI event loop - main.rs / ui.rs]
-        CLI[Headless CLI - headless.rs]
+    subgraph Interfaz
+        TUI[Bucle de eventos del TUI - main.rs / ui.rs]
+        CLI[CLI headless - headless.rs]
     end
     subgraph Worker["DbWorker (db/mod.rs)"]
-        DISPATCH[Request dispatch]
-        WALK[Lineage walkers: relational FKs, Mongo conventions, Neo4j edges]
+        DISPATCH[Despacho de solicitudes]
+        WALK[Recorredores de linaje: FKs relacionales, convenciones Mongo, aristas Neo4j]
     end
-    subgraph Engines
+    subgraph Motores
         MY[(MariaDB/MySQL)]
         PG[(PostgreSQL)]
         SQ[(SQLite)]
@@ -58,12 +59,12 @@ flowchart LR
     DISPATCH -- DbResponse --> CLI
 ```
 
-## Installation
+## Instalación
 
-Requires the Rust toolchain (https://rustup.rs). No libraries need to be
-installed on the system: the database drivers are Rust crates and the only C
-dependency (bundled SQLite) is compiled automatically, so a plain
-`cargo build` is the whole process on every platform.
+Requiere la toolchain de Rust (https://rustup.rs). No hace falta instalar
+librerías en el sistema: los drivers de base de datos son crates de Rust y la
+única dependencia en C (SQLite embebido) se compila automáticamente, así que
+un simple `cargo build` es todo el proceso en cualquier plataforma.
 
 ### Linux
 
@@ -71,93 +72,96 @@ dependency (bundled SQLite) is compiled automatically, so a plain
 git clone https://github.com/dpa23/linajedb.git
 cd linajedb
 cargo build --release
-# binary: target/release/linajedb
+# binario: target/release/linajedb
 ```
 
 ### Windows
 
-Install Rust with rustup (the default MSVC toolchain; it requires the Visual
-Studio Build Tools installer that rustup points to). Then, from any terminal:
+Instala Rust con rustup (la toolchain MSVC por defecto; requiere las Visual
+Studio Build Tools, cuyo instalador el propio rustup indica). Luego, desde
+cualquier terminal:
 
 ```
 git clone https://github.com/dpa23/linajedb.git
 cd linajedb
 cargo build --release
-# binary: target\release\linajedb.exe
+# binario: target\release\linajedb.exe
 ```
 
-The interface uses Unicode box-drawing and geometric characters, so use a
-modern terminal with a font that covers them (any Nerd Font or Cascadia
-Code):
+La interfaz usa caracteres Unicode de cajas y geométricos, así que conviene
+una terminal moderna con una fuente que los cubra (cualquier Nerd Font o
+Cascadia Code):
 
-- Windows: WezTerm or Alacritty are recommended; Windows Terminal also
-  works. The legacy `cmd.exe` console host is not supported.
-- Linux: any modern emulator (WezTerm, Kitty, Alacritty, GNOME Terminal).
+- Windows: se recomienda WezTerm o Alacritty; Windows Terminal también
+  funciona. La consola clásica `cmd.exe` no está soportada.
+- Linux: cualquier emulador moderno (WezTerm, Kitty, Alacritty, GNOME
+  Terminal).
 
-Minimum terminal size: 80x24. The layout is proportional and adapts to any
-size above that; below it, the client shows a resize notice instead of
-rendering a broken layout.
+Tamaño mínimo de terminal: 80x24. El layout es proporcional y se adapta a
+cualquier tamaño por encima de ese; por debajo, el cliente muestra un aviso
+para redimensionar en lugar de renderizar un layout roto.
 
-## TUI usage
+## Uso del TUI
 
 ```bash
-cargo run            # or target/release/linajedb
+cargo run            # o target/release/linajedb
 ```
 
-The connection screen offers three modes: discovered profiles (reads
-`~/.my.cnf` and `~/.pgpass` when present), a manual form, and a raw
-connection URL. Select the engine with Left/Right.
+La pantalla de conexión ofrece tres modos: perfiles descubiertos (lee
+`~/.my.cnf` y `~/.pgpass` cuando existen), un formulario manual y una URL de
+conexión directa. El motor se elige con Izquierda/Derecha.
 
-### Finding things
+### Cómo buscar
 
-| Scope | How |
+| Ámbito | Cómo |
 |---|---|
-| Databases | `d` opens the database list; `/` filters it as you type |
-| Tables / collections / labels | `/` in the sidebar filters the list; Enter opens the selection |
-| Rows | `/` in the data grid filters rows client-side (substring, all columns) |
-| Columns | Left/Right move the cell cursor; the title shows `col N/M (name)` |
+| Bases de datos | `d` abre la lista de bases; `/` la filtra mientras escribes |
+| Tablas / colecciones / labels | `/` en el panel lateral filtra la lista; Enter abre la selección |
+| Filas | `/` en la grilla filtra las filas en el cliente (subcadena, todas las columnas) |
+| Columnas | Izquierda/Derecha mueven el cursor de celda; el título muestra `col N/M (nombre)` |
 
-### Key bindings (data grid)
+### Atajos de teclado (grilla de datos)
 
-| Key | Action |
+| Tecla | Acción |
 |---|---|
-| `t` | Trace the selected row's full lineage; `j` toggles tree/JSON view |
-| `Enter` | Record view: the row as a column/value list with complete values |
-| `Left`/`Right`, `Home`/`End` | Move the cell cursor; columns auto-scroll |
-| `/` | Filter rows in the grid |
-| `i` | Describe table: columns, types, primary/foreign key roles |
-| `e` / `a` / `d` | Edit / add / delete the selected row |
-| `r` | Re-run the current query |
-| `F6` / `F7` | Chart (BI pivot) mode / related-data split |
-| `Tab` | Cycle focus between panes; the toolbar is clickable |
+| `t` | Traza el linaje completo de la fila seleccionada; `j` alterna árbol/JSON |
+| `Enter` | Vista de registro: la fila como lista columna/valor con valores completos |
+| `Izq`/`Der`, `Inicio`/`Fin` | Mueven el cursor de celda; las columnas se desplazan solas |
+| `/` | Filtra filas en la grilla |
+| `i` | Describe la tabla: columnas, tipos, roles de llave primaria/foránea |
+| `e` / `a` / `d` | Editar / agregar / eliminar la fila seleccionada |
+| `r` | Re-ejecuta la consulta actual |
+| `F6` / `F7` | Modo gráfico (pivote BI) / panel de datos relacionados |
+| `Tab` | Cicla el foco entre paneles; la barra de acciones acepta clics |
 
-## Headless trace (scripts and AI agents)
+## Trazado headless (scripts y agentes de IA)
 
 ```bash
-linajedb trace --url mysql://user:pass@host:3306/shop \
-    --table orders --where "id_order=118" --format tree
+linajedb trace --url mysql://usuario:clave@host:3306/tienda \
+    --table ordenes --where "id_orden=118" --format tree
 
 linajedb trace --url mongodb://localhost:27017/app \
-    --table users --where '{"email": "ana@example.com"}'    # JSON output
+    --table usuarios --where '{"correo": "ana@ejemplo.com"}'    # salida JSON
 
-linajedb trace --url bolt://neo4j:password@localhost:7687 \
-    --table Person --where "name=Alice"
+linajedb trace --url bolt://neo4j:clave@localhost:7687 \
+    --table Persona --where "nombre=Alicia"
 ```
 
-JSON is written to stdout (pipe it to `jq` or feed it to a language model);
-errors go to stderr with exit code 1.
+El JSON se escribe a stdout (se puede canalizar a `jq` o entregar a un modelo
+de lenguaje); los errores van a stderr con código de salida 1.
 
-Lineage resolution per engine:
+Resolución del linaje según el motor:
 
-| Engine | Parents | Children |
+| Motor | Padres | Hijas |
 |---|---|---|
-| Relational | declared foreign keys | tables whose foreign keys reference the row |
-| MongoDB | fields named `x_id` / `id_x` / `xId` resolved to collection `x(s)`, with ObjectId and hex-string cross-matching | sibling collections holding such a field equal to the document's `_id` |
-| Neo4j | outgoing relationships | incoming relationships |
+| Relacionales | llaves foráneas declaradas | tablas cuyas llaves foráneas referencian la fila |
+| MongoDB | campos con nombre `x_id` / `id_x` / `xId` resueltos a la colección `x(s)`, con cruce ObjectId y cadena hexadecimal | colecciones hermanas que tengan uno de esos campos igual al `_id` del documento |
+| Neo4j | relaciones salientes | relaciones entrantes |
 
-Bounds: 4 ancestor levels, 3 descendant levels, 5 rows per relation, 200
-nodes in total. Cycles are detected and annotated instead of re-expanded.
+Límites: 4 niveles de ancestros, 3 de descendientes, 5 filas por relación,
+200 nodos en total. Los ciclos se detectan y se anotan en lugar de volver a
+expandirse.
 
-## License
+## Licencia
 
-MIT. See `LICENSE`.
+MIT. Ver `LICENSE`.
