@@ -211,7 +211,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     _ => {}
                 }
 
-                if state.connected && state.active_pane != ActivePane::SqlConsole && state.active_pane != ActivePane::ModalEditor && !state.show_delete_confirm && !state.search_active && !state.show_describe && !state.show_trace && !state.show_row_detail {
+                if state.connected && state.active_pane != ActivePane::SqlConsole && state.active_pane != ActivePane::ModalEditor && !state.show_delete_confirm && !state.search_active && !state.show_describe && !state.show_trace && !state.show_row_detail && !state.sidebar_filter_active {
                     match key.code {
                         KeyCode::Char('1') => {
                             state.active_pane = ActivePane::Sidebar;
@@ -364,39 +364,59 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                     ActivePane::Sidebar => {
-                        match key.code {
-                            KeyCode::Up => {
-                                if state.show_db_list {
-                                    if let Some(idx) = state.selected_db_idx {
-                                        if idx > 0 {
-                                            state.selected_db_idx = Some(idx - 1);
-                                        }
-                                    }
-                                } else {
-                                    if let Some(idx) = state.selected_table_idx {
-                                        if idx > 0 {
-                                            state.selected_table_idx = Some(idx - 1);
-                                        }
-                                    }
+                        // Quick-find typing mode: filters tables or databases as you type.
+                        if state.sidebar_filter_active {
+                            match key.code {
+                                KeyCode::Char(c) => {
+                                    state.sidebar_filter.push(c);
+                                    state.sidebar_clamp_selection();
+                                    continue;
                                 }
+                                KeyCode::Backspace => {
+                                    state.sidebar_filter.pop();
+                                    state.sidebar_clamp_selection();
+                                    continue;
+                                }
+                                KeyCode::Esc => {
+                                    state.sidebar_filter_active = false;
+                                    state.sidebar_filter.clear();
+                                    state.sidebar_clamp_selection();
+                                    continue;
+                                }
+                                KeyCode::Up => {
+                                    state.sidebar_step(false);
+                                    continue;
+                                }
+                                KeyCode::Down => {
+                                    state.sidebar_step(true);
+                                    continue;
+                                }
+                                KeyCode::Enter => {
+                                    // Leave typing mode and let this same Enter
+                                    // open the selected table / database below.
+                                    state.sidebar_filter_active = false;
+                                }
+                                _ => {
+                                    continue;
+                                }
+                            }
+                        }
+                        match key.code {
+                            KeyCode::Char('/') => {
+                                state.sidebar_filter_active = true;
+                                state.sidebar_filter.clear();
+                            }
+                            KeyCode::Up => {
+                                state.sidebar_step(false);
                             }
                             KeyCode::Down => {
-                                if state.show_db_list {
-                                    if let Some(idx) = state.selected_db_idx {
-                                        if idx < state.databases.len() - 1 {
-                                            state.selected_db_idx = Some(idx + 1);
-                                        }
-                                    }
-                                } else {
-                                    if let Some(idx) = state.selected_table_idx {
-                                        if idx < state.tables.len() - 1 {
-                                            state.selected_table_idx = Some(idx + 1);
-                                        }
-                                    }
-                                }
+                                state.sidebar_step(true);
                             }
                             KeyCode::Esc => {
-                                if state.show_db_list {
+                                if !state.sidebar_filter.is_empty() {
+                                    state.sidebar_filter.clear();
+                                    state.sidebar_clamp_selection();
+                                } else if state.show_db_list {
                                     state.show_db_list = false;
                                 } else {
                                     // Disconnect and go back to selection screen
@@ -407,6 +427,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                             KeyCode::Char('d') => {
                                 state.show_db_list = !state.show_db_list;
+                                state.sidebar_filter.clear();
+                                state.sidebar_filter_active = false;
                                 if state.show_db_list {
                                     state.connecting = true;
                                     state.conn_status_msg = "Loading databases...".to_string();

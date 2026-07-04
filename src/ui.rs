@@ -882,55 +882,48 @@ fn draw_data_details(f: &mut Frame, area: Rect, state: &mut AppState, theme: &Th
 fn draw_sidebar(f: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) {
     let is_focused = state.active_pane == ActivePane::Sidebar;
 
-    if state.show_db_list {
-        let block = get_pane_block(" DATABASES/SCHEMAS (Esc/d: Back) ", is_focused, theme);
-        let items: Vec<ListItem> = state
-            .databases
-            .iter()
-            .enumerate()
-            .map(|(idx, db)| {
-                let active = state.selected_db_idx == Some(idx);
-                let style = if active {
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(theme.text_primary)
-                };
-                ListItem::new(format!("  {} {}", if active { "🔘" } else { "  " }, db)).style(style)
-            })
-            .collect();
-            
-        let list = List::new(items).block(block);
-        let mut list_state = ListState::default();
-        list_state.select(state.selected_db_idx);
-        f.render_stateful_widget(list, area, &mut list_state);
+    // Both lists share the quick-find filter; the title reflects it.
+    let visible = state.sidebar_visible_indices();
+    let (source, selected, short_name): (&Vec<String>, Option<usize>, &str) = if state.show_db_list {
+        (&state.databases, state.selected_db_idx, "DATABASES")
     } else {
-        let sidebar_title = match state.active_engine {
-            ActiveEngine::MongoDb => " COLLECTIONS (d: Switch DB) ",
-            ActiveEngine::Neo4j => " LABELS (d: Switch DB) ",
-            _ => " TABLES (d: Switch DB) ",
+        let t = match state.active_engine {
+            ActiveEngine::MongoDb => "COLLECTIONS",
+            ActiveEngine::Neo4j => "LABELS",
+            _ => "TABLES",
         };
-        let block = get_pane_block(sidebar_title, is_focused, theme);
+        (&state.tables, state.selected_table_idx, t)
+    };
 
-        let items: Vec<ListItem> = state
-            .tables
-            .iter()
-            .enumerate()
-            .map(|(idx, table)| {
-                let active = state.selected_table_idx == Some(idx);
-                let style = if active {
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(theme.text_primary)
-                };
-                ListItem::new(format!("  {} {}", if active { "🔘" } else { "  " }, table)).style(style)
-            })
-            .collect();
+    // While filtering, the filter itself is the most important thing to show.
+    let title = if state.sidebar_filter_active || !state.sidebar_filter.is_empty() {
+        let cursor = if state.sidebar_filter_active { "▏" } else { "" };
+        format!(" {} /{}{} ({}) ", short_name, state.sidebar_filter, cursor, visible.len())
+    } else if state.show_db_list {
+        format!(" {} (/: find · Esc: back) ", short_name)
+    } else {
+        format!(" {} (/: find · d: DBs) ", short_name)
+    };
+    let block = get_pane_block(&title, is_focused, theme);
 
-        let list = List::new(items).block(block);
-        let mut list_state = ListState::default();
-        list_state.select(state.selected_table_idx);
-        f.render_stateful_widget(list, area, &mut list_state);
-    }
+    let items: Vec<ListItem> = visible
+        .iter()
+        .map(|&idx| {
+            let name = &source[idx];
+            let active = selected == Some(idx);
+            let style = if active {
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.text_primary)
+            };
+            ListItem::new(format!("  {} {}", if active { "▸" } else { " " }, name)).style(style)
+        })
+        .collect();
+
+    let list = List::new(items).block(block);
+    let mut list_state = ListState::default();
+    list_state.select(selected.and_then(|s| visible.iter().position(|&i| i == s)));
+    f.render_stateful_widget(list, area, &mut list_state);
 }
 
 // Subtle alternating-row (zebra) background for readability.

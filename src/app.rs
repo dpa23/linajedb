@@ -149,9 +149,9 @@ impl ToolbarAction {
             ToolbarAction::Refresh => "⟲ Refresh",
             ToolbarAction::ToggleChart => "▤ Chart",
             ToolbarAction::ToggleRelated => "⮌ Related",
-            ToolbarAction::Databases => "🗁 DBs",
+            ToolbarAction::Databases => "⛁ DBs",
             ToolbarAction::Back => "← Back",
-            ToolbarAction::Disconnect => "⏻ Disconnect",
+            ToolbarAction::Disconnect => "✕ Disconnect",
         }
     }
 
@@ -356,6 +356,11 @@ pub struct AppState {
     pub describe_headers: Vec<String>, // describe table headers
     pub describe_rows: Vec<Vec<String>>, // describe table rows
 
+    // Sidebar quick-find: one filter box shared by the tables list and the
+    // databases list (whichever is currently shown).
+    pub sidebar_filter: String,
+    pub sidebar_filter_active: bool,
+
     // lazysql-style grid navigation
     pub selected_col_idx: usize,     // cell cursor column (index into result_headers)
     pub show_row_detail: bool,       // record view: selected row as column/value list
@@ -502,6 +507,8 @@ impl AppState {
             show_describe: false,
             describe_headers: vec![],
             describe_rows: vec![],
+            sidebar_filter: String::new(),
+            sidebar_filter_active: false,
             selected_col_idx: 0,
             show_row_detail: false,
             row_detail_scroll: 0,
@@ -874,6 +881,8 @@ impl AppState {
             DbResponse::Databases(dbs) => {
                 self.databases = dbs;
                 self.selected_db_idx = if !self.databases.is_empty() { Some(0) } else { None };
+                self.sidebar_filter.clear();
+                self.sidebar_filter_active = false;
             }
             DbResponse::DatabaseSelected => {
                 self.tables.clear();
@@ -884,6 +893,8 @@ impl AppState {
             DbResponse::Tables(tbls) => {
                 self.tables = tbls;
                 self.exploration_history.clear();
+                self.sidebar_filter.clear();
+                self.sidebar_filter_active = false;
                 if !self.tables.is_empty() {
                     self.selected_table_idx = Some(0);
                     let table = &self.tables[0];
@@ -1809,6 +1820,54 @@ impl AppState {
         self.show_describe = !self.show_describe;
     }
 
+    /// Indices of the sidebar entries (tables or databases, depending on the
+    /// current mode) that match the quick-find filter.
+    pub fn sidebar_visible_indices(&self) -> Vec<usize> {
+        let src = if self.show_db_list { &self.databases } else { &self.tables };
+        let f = self.sidebar_filter.to_lowercase();
+        src.iter()
+            .enumerate()
+            .filter(|(_, name)| f.is_empty() || name.to_lowercase().contains(&f))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Move the sidebar selection within the filtered entries.
+    pub fn sidebar_step(&mut self, down: bool) {
+        let vis = self.sidebar_visible_indices();
+        if vis.is_empty() {
+            return;
+        }
+        let sel = if self.show_db_list { self.selected_db_idx } else { self.selected_table_idx };
+        let pos = sel.and_then(|s| vis.iter().position(|&i| i == s));
+        let new_pos = match pos {
+            Some(p) if down => (p + 1).min(vis.len() - 1),
+            Some(p) => p.saturating_sub(1),
+            None => 0,
+        };
+        let new_sel = Some(vis[new_pos]);
+        if self.show_db_list {
+            self.selected_db_idx = new_sel;
+        } else {
+            self.selected_table_idx = new_sel;
+        }
+    }
+
+    /// Keep the sidebar selection on a visible entry while the filter changes.
+    pub fn sidebar_clamp_selection(&mut self) {
+        let vis = self.sidebar_visible_indices();
+        let sel = if self.show_db_list { self.selected_db_idx } else { self.selected_table_idx };
+        let ok = sel.map(|s| vis.contains(&s)).unwrap_or(false);
+        if !ok {
+            let new_sel = vis.first().copied();
+            if self.show_db_list {
+                self.selected_db_idx = new_sel;
+            } else {
+                self.selected_table_idx = new_sel;
+            }
+        }
+    }
+
     /// Open the row-trace overlay for the selected result row and build the
     /// worker request that walks its full FK lineage (ancestors + descendants).
     pub fn open_row_trace(&mut self) -> Option<DbRequest> {
@@ -2037,7 +2096,12 @@ impl AppState {
                 // rect represents the inner area of the sidebar block
                 let click_idx = row as i32 - rect.y as i32;
                 if click_idx >= 0 {
-                    let click_idx = click_idx as usize;
+                    // Map the clicked line through the quick-find filter.
+                    let vis = self.sidebar_visible_indices();
+                    let click_idx = match vis.get(click_idx as usize) {
+                        Some(&real) => real,
+                        None => return None,
+                    };
                     if self.show_db_list {
                         if click_idx < self.databases.len() {
                             self.selected_db_idx = Some(click_idx);
