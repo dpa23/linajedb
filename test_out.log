@@ -1,0 +1,43 @@
+Querying permisos table...
+Column #0 'id_permisos':
+  - Type Name: BIGINT UNSIGNED
+  - Debug Info: MySqlTypeInfo { type: LongLong, flags: ColumnFlags(NOT_NULL | PRIMARY_KEY | UNSIGNED | AUTO_INCREMENT), char_set: 63, max_size: Some(20) }
+  - i64: Err(ColumnDecode { index: "0", source: "mismatched types; Rust type `i64` (as SQL type `BIGINT`) is not compatible with SQL type `BIGINT UNSIGNED`" })
+  - u64: Ok(1)
+----------------------------------
+Column #1 'nombre':
+  - Type Name: VARCHAR
+  - Debug Info: MySqlTypeInfo { type: VarString, flags: ColumnFlags(NOT_NULL | NO_DEFAULT_VALUE), char_set: 224, max_size: Some(600) }
+  - i64: Err(ColumnDecode { index: "1", source: "mismatched types; Rust type `i64` (as SQL type `BIGINT`) is not compatible with SQL type `VARCHAR`" })
+  - u64: Err(ColumnDecode { index: "1", source: "mismatched types; Rust type `u64` (as SQL type `BIGINT UNSIGNED`) is not compatible with SQL type `VARCHAR`" })
+----------------------------------
+Column #2 'slug':
+  - Type Name: VARCHAR
+  - Debug Info: MySqlTypeInfo { type: VarString, flags: ColumnFlags(0x0), char_set: 224, max_size: Some(1020) }
+  - i64: Err(ColumnDecode { index: "2", source: "mismatched types; Rust type `i64` (as SQL type `BIGINT`) is not compatible with SQL type `VARCHAR`" })
+  - u64: Err(ColumnDecode { index: "2", source: "mismatched types; Rust type `u64` (as SQL type `BIGINT UNSIGNED`) is not compatible with SQL type `VARCHAR`" })
+----------------------------------
+Column #3 'descripcion':
+  - Type Name: VARCHAR
+  - Debug Info: MySqlTypeInfo { type: VarString, flags: ColumnFlags(0x0), char_set: 224, max_size: Some(1020) }
+  - i64: Err(ColumnDecode { index: "3", source: "mismatched types; Rust type `i64` (as SQL type `BIGINT`) is not compatible with SQL type `VARCHAR`" })
+  - u64: Err(ColumnDecode { index: "3", source: "mismatched types; Rust type `u64` (as SQL type `BIGINT UNSIGNED`) is not compatible with SQL type `VARCHAR`" })
+----------------------------------
+Column #4 'id_grupo_permisos':
+  - Type Name: BIGINT UNSIGNED
+  - Debug Info: MySqlTypeInfo { type: LongLong, flags: ColumnFlags(MULTIPLE_KEY | UNSIGNED), char_set: 63, max_size: Some(20) }
+  - i64: Err(ColumnDecode { index: "4", source: "mismatched types; Rust type `i64` (as SQL type `BIGINT`) is not compatible with SQL type `BIGINT UNSIGNED`" })
+  - u64: Ok(1)
+----------------------------------
+Column #5 'created_at':
+  - Type Name: TIMESTAMP
+  - Debug Info: MySqlTypeInfo { type: Timestamp, flags: ColumnFlags(UNSIGNED | BINARY), char_set: 63, max_size: Some(19) }
+  - i64: Err(ColumnDecode { index: "5", source: "mismatched types; Rust type `i64` (as SQL type `BIGINT`) is not compatible with SQL type `TIMESTAMP`" })
+  - u64: Err(ColumnDecode { index: "5", source: "mismatched types; Rust type `u64` (as SQL type `BIGINT UNSIGNED`) is not compatible with SQL type `TIMESTAMP`" })
+----------------------------------
+Column #6 'updated_at':
+  - Type Name: TIMESTAMP
+  - Debug Info: MySqlTypeInfo { type: Timestamp, flags: ColumnFlags(UNSIGNED | BINARY), char_set: 63, max_size: Some(19) }
+  - i64: Err(ColumnDecode { index: "6", source: "mismatched types; Rust type `i64` (as SQL type `BIGINT`) is not compatible with SQL type `TIMESTAMP`" })
+  - u64: Err(ColumnDecode { index: "6", source: "mismatched types; Rust type `u64` (as SQL type `BIGINT UNSIGNED`) is not compatible with SQL type `TIMESTAMP`" })
+----------------------------------

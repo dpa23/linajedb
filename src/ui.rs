@@ -1,0 +1,1794 @@
+use crate::app::{ActiveEngine, ActivePane, AppState, BiChartType, ToolbarAction};
+use ratatui::{
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style, Stylize},
+    text::{Line, Span},
+    widgets::{Bar, BarChart, BarGroup, Block, Borders, Clear, List, ListItem, ListState, Paragraph, Row, Sparkline, Table, Wrap},
+    Frame,
+};
+
+#[derive(Debug, Clone)]
+pub struct BiBarData {
+    pub label: String,
+    pub value: u64,
+}
+
+// Charcoal / Slate Modern Palette
+pub struct Theme {
+    pub border_active: Color,
+    pub border_inactive: Color,
+    pub text_primary: Color,
+    pub text_secondary: Color,
+    pub header_fg: Color,
+    pub accent: Color,
+    pub danger: Color,
+    pub success: Color,
+}
+
+impl Default for Theme {
+    fn default() -> Self {
+        Self {
+            border_active: Color::Rgb(137, 180, 250),   // Pastel Blue
+            border_inactive: Color::Rgb(88, 91, 112),   // Dark Grey
+            text_primary: Color::Rgb(220, 224, 232),    // Off-white
+            text_secondary: Color::Rgb(166, 173, 200),  // Muted gray
+            header_fg: Color::Rgb(249, 226, 175),       // Soft gold
+            accent: Color::Rgb(137, 220, 235),          // Teal
+            danger: Color::Rgb(243, 139, 168),          // Red
+            success: Color::Rgb(166, 227, 161),         // Green
+        }
+    }
+}
+
+pub fn get_pane_block(title: &str, is_focused: bool, theme: &Theme) -> Block<'static> {
+    if is_focused {
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme.border_active))
+            .title(format!(" [{}] ", title))
+            .title_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+    } else {
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme.border_inactive))
+            .title(format!(" {} ", title))
+            .title_style(Style::default().fg(theme.text_secondary))
+    }
+}
+
+pub fn get_centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(r);
+
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(popup_layout[1])[1]
+}
+
+pub fn draw_ui(f: &mut Frame, state: &mut AppState) {
+    let size = f.size();
+    let theme = Theme::default();
+
+    // Responsive warning if terminal is too small
+    if size.width < 80 || size.height < 24 {
+        let warning_text = format!(
+            "Terminal size too small!\n\nMinimum required: 80x24\nCurrent size: {}x{}\n\nPlease resize your terminal window.",
+            size.width, size.height
+        );
+        let paragraph = Paragraph::new(warning_text)
+            .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(theme.danger)))
+            .alignment(ratatui::layout::Alignment::Center)
+            .style(Style::default().fg(theme.header_fg));
+        f.render_widget(paragraph, size);
+        return;
+    }
+
+    // Connect Screen Overlay (if not connected)
+    if !state.connected {
+        draw_connection_screen(f, size, state, &theme);
+        return;
+    }
+
+    // Normal Layout splits: Header (tabs), Action toolbar, Main workspace, Console, Footer
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // Header Tab Bar
+            Constraint::Length(1), // Clickable action toolbar
+            Constraint::Min(8),    // Main View (Tables list + Data panel)
+            Constraint::Length(3), // SQL input console
+            Constraint::Length(1), // Footer status bar
+        ])
+        .split(size);
+
+    draw_header_tabs(f, chunks[0], state, &theme);
+    draw_action_toolbar(f, chunks[1], state, &theme);
+    draw_workspace(f, chunks[2], state, &theme);
+    draw_sql_console(f, chunks[3], state, &theme);
+    draw_footer_status(f, chunks[4], state, &theme);
+
+    // Draw modals if active
+    if state.show_edit_modal || state.show_add_modal {
+        draw_row_editor_modal(f, size, state, &theme);
+    } else if state.show_delete_confirm {
+        draw_delete_confirm_modal(f, size, state, &theme);
+    } else if state.show_row_detail {
+        draw_row_detail_modal(f, size, state, &theme);
+    } else if state.show_trace {
+        draw_trace_modal(f, size, state, &theme);
+    } else if state.show_describe {
+        draw_describe_modal(f, size, state, &theme);
+    }
+}
+
+/// lazysql-style record view: the selected row as a column/value list with
+/// full (wrapped) values, for rows too wide to read in the grid.
+fn draw_row_detail_modal(f: &mut Frame, container_area: Rect, state: &mut AppState, theme: &Theme) {
+    let modal_area = get_centered_rect(70, 75, container_area);
+    f.render_widget(Clear, modal_area);
+    state.rect_row_detail = Some(modal_area);
+
+    let table_label = state.active_table_name.clone().unwrap_or_else(|| "result set".to_string());
+    let row_pos = state.selected_row_idx.map(|i| i + 1).unwrap_or(0);
+    let title = format!(" RECORD: {}  ·  row {}/{} ", table_label, row_pos, state.result_rows.len());
+    let block = get_pane_block(&title, true, theme).bg(Color::Black);
+    f.render_widget(block.clone(), modal_area);
+    let inner = block.inner(modal_area);
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(1)])
+        .split(inner);
+
+    let row = state
+        .selected_row_idx
+        .and_then(|i| state.result_rows.get(i))
+        .cloned()
+        .unwrap_or_default();
+
+    // Manual wrapping so the scroll clamp knows the exact line count:
+    // "  column ┆ value", continuation lines indented under the value column.
+    let key_w = state
+        .result_headers
+        .iter()
+        .map(|h| h.chars().count())
+        .max()
+        .unwrap_or(6)
+        .min(28);
+    let val_w = (layout[0].width as usize).saturating_sub(key_w + 6).max(10);
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (c, header) in state.result_headers.iter().enumerate() {
+        let val = row.get(c).map(|s| s.as_str()).unwrap_or("");
+        let is_cursor_col = c == state.selected_col_idx;
+        let key_style = if is_cursor_col {
+            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        } else {
+            Style::default().fg(theme.accent)
+        };
+        let val_style = if val == "NULL" {
+            Style::default().fg(theme.border_inactive).add_modifier(Modifier::ITALIC)
+        } else {
+            Style::default().fg(theme.text_primary)
+        };
+
+        let chars: Vec<char> = val.chars().collect();
+        let mut first = true;
+        let mut start = 0;
+        while start < chars.len() || first {
+            let end = (start + val_w).min(chars.len());
+            let chunk: String = chars[start..end].iter().collect();
+            let key_part = if first {
+                format!("  {:>key_w$} ┆ ", header.chars().take(key_w).collect::<String>(), key_w = key_w)
+            } else {
+                format!("  {:>key_w$} ┆ ", "", key_w = key_w)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(key_part, key_style),
+                Span::styled(chunk, val_style),
+            ]));
+            first = false;
+            start = end;
+            if start >= chars.len() {
+                break;
+            }
+        }
+    }
+
+    state.row_detail_line_count = lines.len();
+    let visible = layout[0].height as usize;
+    let max_scroll = lines.len().saturating_sub(visible);
+    if state.row_detail_scroll > max_scroll {
+        state.row_detail_scroll = max_scroll;
+    }
+
+    let body = Paragraph::new(lines).scroll((state.row_detail_scroll as u16, 0));
+    f.render_widget(body, layout[0]);
+
+    let footer = format!(
+        "  {} columns  ·  ↑↓ PgUp/PgDn scroll  ·  ⏎/Esc close",
+        state.result_headers.len()
+    );
+    f.render_widget(
+        Paragraph::new(footer).style(Style::default().fg(theme.border_inactive)),
+        layout[1],
+    );
+}
+
+/// Row-trace overlay: full lineage of the selected row — ancestors
+/// (parents of parents) and descendants (children of children) — as a
+/// colored tree or as raw JSON ([j] toggles).
+fn draw_trace_modal(f: &mut Frame, container_area: Rect, state: &mut AppState, theme: &Theme) {
+    let modal_area = get_centered_rect(84, 82, container_area);
+    f.render_widget(Clear, modal_area);
+    state.rect_trace = Some(modal_area);
+
+    let table_label = state.active_table_name.clone().unwrap_or_else(|| "row".to_string());
+    let mode = if state.trace_json_mode { "JSON" } else { "TREE" };
+    let title = format!(" TRACE: {}  ·  view: {} ", table_label, mode);
+    let block = get_pane_block(&title, true, theme).bg(Color::Black);
+    f.render_widget(block.clone(), modal_area);
+    let inner = block.inner(modal_area);
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(1)])
+        .split(inner);
+
+    let (lines, footer_info): (Vec<Line>, String) = if state.trace_loading {
+        (
+            vec![Line::from(Span::styled(
+                "  Tracing row lineage (ancestors + descendants)...",
+                Style::default().fg(theme.accent),
+            ))],
+            "loading".to_string(),
+        )
+    } else if let Some(ref err) = state.trace_error {
+        (
+            vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    format!("  Trace failed: {}", err),
+                    Style::default().fg(theme.danger),
+                )),
+            ],
+            "error".to_string(),
+        )
+    } else if let Some(root) = state.trace_root.clone() {
+        if state.trace_json_mode {
+            let json = serde_json::to_string_pretty(&root.to_json())
+                .unwrap_or_else(|e| format!("JSON error: {}", e));
+            let lines = json
+                .lines()
+                .map(|l| render_trace_json_line(l, theme))
+                .collect();
+            (lines, format!("{} nodes", root.node_count()))
+        } else {
+            let mut lines = Vec::new();
+            render_trace_node(&root, "", true, true, &mut lines, theme);
+            (lines, format!("{} nodes", root.node_count()))
+        }
+    } else {
+        (
+            vec![Line::from(Span::styled(
+                "  No trace loaded. Select a row and press [t].",
+                Style::default().fg(theme.text_secondary),
+            ))],
+            "empty".to_string(),
+        )
+    };
+
+    // Clamp scroll now that the real line count is known.
+    state.trace_line_count = lines.len();
+    let visible = layout[0].height as usize;
+    let max_scroll = lines.len().saturating_sub(visible);
+    if state.trace_scroll > max_scroll {
+        state.trace_scroll = max_scroll;
+    }
+
+    let body = Paragraph::new(lines).scroll((state.trace_scroll as u16, 0));
+    f.render_widget(body, layout[0]);
+
+    let footer = format!(
+        "  ▲ parents · ▼ children · {}  |  [j] tree/json  ·  ↑↓ PgUp/PgDn scroll  ·  [t]/Esc close",
+        footer_info
+    );
+    f.render_widget(
+        Paragraph::new(footer).style(Style::default().fg(theme.border_inactive)),
+        layout[1],
+    );
+}
+
+/// One line per node: branch guides + direction glyph + table + row summary,
+/// with the FK that led there rendered dimmed underneath-in-line.
+fn render_trace_node(
+    node: &crate::db::TraceNode,
+    prefix: &str,
+    is_last: bool,
+    is_root: bool,
+    lines: &mut Vec<Line<'static>>,
+    theme: &Theme,
+) {
+    use crate::db::TraceKind;
+
+    let (glyph, color) = match node.kind {
+        TraceKind::Root => ("●", theme.header_fg),
+        TraceKind::Parent => ("▲", theme.accent),
+        TraceKind::Child => ("▼", theme.success),
+    };
+
+    // Row summary: first few columns as col=val, values truncated.
+    let mut summary = String::new();
+    for (col, val) in node.columns.iter().zip(node.values.iter()).take(5) {
+        if !summary.is_empty() {
+            summary.push_str(", ");
+        }
+        let mut v = val.clone();
+        if v.chars().count() > 18 {
+            v = format!("{}…", v.chars().take(17).collect::<String>());
+        }
+        summary.push_str(&format!("{}={}", col, v));
+    }
+    if node.columns.len() > 5 {
+        summary.push_str(", …");
+    }
+
+    let branch = if is_root {
+        " ".to_string()
+    } else if is_last {
+        format!(" {}└─", prefix)
+    } else {
+        format!(" {}├─", prefix)
+    };
+
+    let mut spans: Vec<Span> = vec![
+        Span::styled(branch.clone(), Style::default().fg(theme.border_inactive)),
+        Span::styled(
+            format!("{} {} ", glyph, node.table),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if !node.via.is_empty() {
+        spans.push(Span::styled(
+            format!("({}) ", node.via),
+            Style::default().fg(theme.border_inactive),
+        ));
+    }
+    spans.push(Span::styled(summary, Style::default().fg(theme.text_secondary)));
+    if let Some(ref note) = node.note {
+        let note_color = if note.contains("error") || note.contains("cycle") {
+            theme.danger
+        } else {
+            theme.border_inactive
+        };
+        spans.push(Span::styled(
+            format!("  [{}]", note),
+            Style::default().fg(note_color).add_modifier(Modifier::ITALIC),
+        ));
+    }
+    lines.push(Line::from(spans));
+
+    let child_prefix = if is_root {
+        " ".to_string()
+    } else if is_last {
+        format!("{}   ", prefix)
+    } else {
+        format!("{}│  ", prefix)
+    };
+    let count = node.children.len();
+    for (i, child) in node.children.iter().enumerate() {
+        render_trace_node(child, &child_prefix, i == count - 1, false, lines, theme);
+    }
+}
+
+/// Light syntax coloring for the JSON view: keys accented, structure dimmed.
+fn render_trace_json_line(raw: &str, theme: &Theme) -> Line<'static> {
+    let indent_len = raw.len() - raw.trim_start().len();
+    let (indent, rest) = raw.split_at(indent_len);
+    let mut spans: Vec<Span> = vec![Span::raw(format!(" {}", indent))];
+    if let Some(colon) = rest.find("\": ") {
+        let (key, value) = rest.split_at(colon + 2);
+        spans.push(Span::styled(
+            key.to_string(),
+            Style::default().fg(theme.accent),
+        ));
+        spans.push(Span::styled(
+            value.to_string(),
+            Style::default().fg(theme.text_primary),
+        ));
+    } else {
+        spans.push(Span::styled(
+            rest.to_string(),
+            Style::default().fg(theme.text_secondary),
+        ));
+    }
+    Line::from(spans)
+}
+
+fn draw_describe_modal(f: &mut Frame, container_area: Rect, state: &mut AppState, theme: &Theme) {
+    let modal_area = get_centered_rect(70, 75, container_area);
+    f.render_widget(Clear, modal_area);
+    state.rect_describe = Some(modal_area);
+
+    let table_label = state.active_table_name.clone().unwrap_or_else(|| "result set".to_string());
+    let pk_note = match &state.primary_key {
+        Some(pk) => format!("PK: {}", pk),
+        None => "PK: (none detected)".to_string(),
+    };
+    let block = get_pane_block(&format!(" DESCRIBE: {}  ·  {} ", table_label, pk_note), true, theme)
+        .bg(Color::Black);
+    f.render_widget(block.clone(), modal_area);
+    let inner = block.inner(modal_area);
+
+    if state.describe_rows.is_empty() {
+        let msg = Paragraph::new("\n  No columns to describe yet. Load a table first.")
+            .style(Style::default().fg(theme.text_secondary));
+        f.render_widget(msg, inner);
+        return;
+    }
+
+    let widths = [
+        Constraint::Length(4),       // #
+        Constraint::Percentage(34),  // Column
+        Constraint::Length(11),      // Type
+        Constraint::Percentage(28),  // Key/role
+        Constraint::Percentage(30),  // Sample
+    ];
+
+    let header = Row::new(
+        state.describe_headers.iter().map(|h| {
+            ratatui::widgets::Cell::from(format!(" {}", h))
+                .style(Style::default().fg(theme.header_fg).add_modifier(Modifier::BOLD))
+        }),
+    )
+    .height(1)
+    .bottom_margin(1)
+    .style(Style::default().bg(HEADER_BG));
+
+    let rows: Vec<Row> = state.describe_rows.iter().enumerate().map(|(i, r)| {
+        let key_role = r.get(3).cloned().unwrap_or_default();
+        let cells = r.iter().enumerate().map(|(c, val)| {
+            let style = if c == 3 && !key_role.is_empty() {
+                // Highlight PK/FK roles
+                if key_role.contains("PK") {
+                    Style::default().fg(theme.header_fg).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(theme.accent)
+                }
+            } else if c == 1 {
+                Style::default().fg(theme.text_primary).add_modifier(Modifier::BOLD)
+            } else if c == 2 {
+                Style::default().fg(theme.success)
+            } else {
+                Style::default().fg(theme.text_secondary)
+            };
+            ratatui::widgets::Cell::from(format!(" {}", val)).style(style)
+        });
+        let row = Row::new(cells).height(1);
+        if i % 2 == 1 { row.style(Style::default().bg(ZEBRA_BG)) } else { row }
+    }).collect();
+
+    let footer = format!(
+        "  {} columns  ·  press [i] / Esc to close",
+        state.describe_rows.len()
+    );
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(1)])
+        .split(inner);
+
+    let table = Table::new(rows, widths).header(header).block(Block::default());
+    f.render_widget(table, layout[0]);
+    f.render_widget(
+        Paragraph::new(footer).style(Style::default().fg(theme.border_inactive)),
+        layout[1],
+    );
+}
+
+fn draw_connection_screen(f: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) {
+    // Render back wall of selector screen
+    let outer_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.border_inactive))
+        .title(" linaje.db — Row-Lineage Database Client ")
+        .title_style(Style::default().fg(theme.header_fg).add_modifier(Modifier::BOLD));
+    
+    let welcome_msg = Paragraph::new(
+        "\n  Welcome to linaje.db — Multi-Engine Terminal Client with Row Lineage\n\n  Press [F2] for Profiles, [F3] for Manual Form, [F4] for Raw Connection URL.\n  Use Left/Right to change engines, Up/Down to navigate fields, and Enter to connect.\n"
+    ).block(outer_block).style(Style::default().fg(theme.text_secondary));
+    f.render_widget(welcome_msg, area);
+
+    // Draw centered connecting modal dialog (larger size to fit forms)
+    let modal_area = get_centered_rect(85, 75, area);
+    f.render_widget(Clear, modal_area);
+
+    let is_focused = state.active_pane == ActivePane::EngineSelector;
+    let modal_block = get_pane_block(" CONNECTION SETUP ", is_focused, theme);
+    f.render_widget(modal_block.clone(), modal_area);
+
+    let inner_area = modal_block.inner(modal_area);
+
+    // Split inner area horizontally: Left (25% for Engine List), Right (75% for credentials/setup)
+    let setup_splits = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(25), // Engines List
+            Constraint::Percentage(75), // Connection details form
+        ])
+        .split(inner_area);
+
+    // 1. Draw Left Pane (Engines List)
+    let engine_block = Block::default()
+        .borders(Borders::RIGHT)
+        .border_style(Style::default().fg(theme.border_inactive))
+        .title(" Database Engines ");
+    
+    let items: Vec<ListItem> = vec![
+        ActiveEngine::MariaDb,
+        ActiveEngine::PostgreSql,
+        ActiveEngine::Sqlite,
+        ActiveEngine::MongoDb,
+        ActiveEngine::Neo4j,
+        ActiveEngine::LocalJson,
+    ]
+    .into_iter()
+    .map(|eng| {
+        let active = state.active_engine == eng;
+        let style = if active {
+            Style::default().bg(theme.border_active).fg(Color::Black).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.text_primary)
+        };
+        ListItem::new(format!(" {} {}", if active { "▶" } else { " " }, eng.name())).style(style)
+    })
+    .collect();
+    let engine_list = List::new(items).block(engine_block);
+    f.render_widget(engine_list, setup_splits[0]);
+
+    // 2. Draw Right Pane (Credentials Form or Profiles list)
+    // Splits: Modes Tab bar (Length 3), Form Content (Min 5), Status Line (Length 1)
+    let right_splits = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // Modes tabs
+            Constraint::Min(5),    // Mode content
+            Constraint::Length(1), // Status line
+        ])
+        .split(setup_splits[1]);
+
+    // Draw Modes Tabs
+    let mode_tabs_titles = vec!["[F2] Discovered Profiles", "[F3] Manual Form", "[F4] Raw URL"];
+    let active_mode_idx = match state.connection_mode {
+        crate::app::ConnectionMode::Profiles => 0,
+        crate::app::ConnectionMode::Form => 1,
+        crate::app::ConnectionMode::RawUrl => 2,
+    };
+    let mode_tabs = ratatui::widgets::Tabs::new(mode_tabs_titles)
+        .block(Block::default().borders(Borders::BOTTOM).border_style(Style::default().fg(theme.border_inactive)))
+        .select(active_mode_idx)
+        .style(Style::default().fg(theme.text_secondary))
+        .highlight_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
+    f.render_widget(mode_tabs, right_splits[0]);
+
+    // Draw Mode Content
+    let content_area = right_splits[1];
+    match state.connection_mode {
+        crate::app::ConnectionMode::Profiles => {
+            // Filter profiles matching current active engine
+            let filtered_profiles: Vec<(usize, &crate::app::ConnectionProfile)> = state.profiles
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| p.engine == state.active_engine)
+                .collect();
+
+            if filtered_profiles.is_empty() {
+                let empty_para = Paragraph::new("\n  No discovered profiles found for this engine.\n  Use F3 to enter credentials manually.")
+                    .style(Style::default().fg(theme.text_secondary));
+                f.render_widget(empty_para, content_area);
+            } else {
+                let items: Vec<ListItem> = filtered_profiles
+                    .iter()
+                    .enumerate()
+                    .map(|(_, (original_idx, profile))| {
+                        let is_selected = state.selected_profile_idx == *original_idx;
+                        let style = if is_selected {
+                            Style::default().bg(Color::Rgb(49, 50, 68)).fg(theme.border_active).add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(theme.text_primary)
+                        };
+                        ListItem::new(format!("  {}  {}", if is_selected { "●" } else { "○" }, profile.name)).style(style)
+                    })
+                    .collect();
+                let profiles_list = List::new(items).block(Block::default().title(" Select Profile "));
+                f.render_widget(profiles_list, content_area);
+            }
+        }
+        crate::app::ConnectionMode::Form => {
+            // Form has 5 input fields
+            let form_layout = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(2), // Host
+                    Constraint::Length(2), // Port
+                    Constraint::Length(2), // User
+                    Constraint::Length(2), // Pass
+                    Constraint::Length(2), // Db/Path
+                ])
+                .split(content_area);
+
+            let fields = [
+                (crate::app::FormField::Host, &state.form_fields.host),
+                (crate::app::FormField::Port, &state.form_fields.port),
+                (crate::app::FormField::User, &state.form_fields.user),
+                (crate::app::FormField::Pass, &state.form_fields.pass),
+                (crate::app::FormField::Db, &state.form_fields.db_or_path),
+            ];
+
+            for (idx, (field, value)) in fields.iter().enumerate() {
+                let is_active = state.active_form_field == *field;
+                let text_style = if is_active {
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(theme.text_secondary)
+                };
+
+                let label_text = format!(" {} ", field.label(state.active_engine));
+                let value_display = if *field == crate::app::FormField::Pass {
+                    "*".repeat(value.len())
+                } else {
+                    (*value).clone()
+                };
+
+                let input_line = Line::from(vec![
+                    Span::styled(label_text, text_style),
+                    Span::styled(value_display, Style::default().fg(theme.text_primary)),
+                ]);
+
+                let block_style = if is_active {
+                    Style::default().fg(theme.border_active)
+                } else {
+                    Style::default().fg(theme.border_inactive)
+                };
+                let row_block = Block::default().borders(Borders::BOTTOM).border_style(block_style);
+                f.render_widget(Paragraph::new(input_line).block(row_block), form_layout[idx]);
+
+                if is_focused && is_active && !state.connecting {
+                    let label_len = field.label(state.active_engine).len() as u16;
+                    let cursor_x = form_layout[idx].x + label_len + value.len() as u16 + 2;
+                    let cursor_y = form_layout[idx].y;
+                    f.set_cursor(cursor_x, cursor_y);
+                }
+            }
+        }
+        crate::app::ConnectionMode::RawUrl => {
+            let conn_val = match state.active_engine {
+                ActiveEngine::MariaDb => &state.conn_fields.mysql_url,
+                ActiveEngine::PostgreSql => &state.conn_fields.postgres_url,
+                ActiveEngine::Sqlite => &state.conn_fields.sqlite_path,
+                ActiveEngine::MongoDb => &state.conn_fields.mongodb_url,
+                ActiveEngine::Neo4j => &state.conn_fields.neo4j_url,
+                ActiveEngine::LocalJson => &state.conn_fields.json_path,
+            };
+
+            let conn_label = match state.active_engine {
+                ActiveEngine::MariaDb => "Raw MySQL Connection URL:",
+                ActiveEngine::PostgreSql => "Raw PostgreSQL Connection URL:",
+                ActiveEngine::Sqlite => "SQLite file path:",
+                ActiveEngine::MongoDb => "Raw MongoDB Connection URL:",
+                ActiveEngine::Neo4j => "Raw Neo4j Bolt URL:",
+                ActiveEngine::LocalJson => "JSON file path:",
+            };
+
+            let raw_layout = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(1), // Spacer
+                    Constraint::Length(1), // Label
+                    Constraint::Length(3), // Input
+                ])
+                .split(content_area);
+
+            f.render_widget(Paragraph::new(conn_label).style(Style::default().fg(theme.header_fg).add_modifier(Modifier::BOLD)), raw_layout[1]);
+            let input_block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(theme.border_inactive));
+            f.render_widget(Paragraph::new(conn_val.as_str()).block(input_block).style(Style::default().fg(theme.text_primary)), raw_layout[2]);
+
+            if is_focused && !state.connecting {
+                let cursor_x = raw_layout[2].x + conn_val.len() as u16 + 1;
+                let cursor_y = raw_layout[2].y + 1;
+                f.set_cursor(cursor_x, cursor_y);
+            }
+        }
+    }
+
+    // Draw Status message
+    let status_style = if state.connecting {
+        Style::default().fg(theme.header_fg).add_modifier(Modifier::SLOW_BLINK)
+    } else if state.conn_status_msg.starts_with("Error") {
+        Style::default().fg(theme.danger)
+    } else {
+        Style::default().fg(theme.success)
+    };
+    
+    let status_text = if state.connecting {
+        "Connecting to database... Please wait."
+    } else {
+        &state.conn_status_msg
+    };
+    f.render_widget(Paragraph::new(status_text).style(status_style), right_splits[2]);
+}
+
+fn draw_header_tabs(f: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) {
+    state.rect_header_tabs = Some(area);
+
+    let tabs_titles = vec!["[1] Tables/Schemas List", "[2] SQL Console", "[3] Visual BI Dash"];
+    let is_focused = state.active_pane == ActivePane::EngineSelector;
+    let border_color = if is_focused { theme.border_active } else { theme.border_inactive };
+
+    let block = Block::default()
+        .borders(Borders::BOTTOM)
+        .border_style(Style::default().fg(border_color))
+        .title(format!(" linaje.db - {} Client ", state.active_engine.name()))
+        .title_style(Style::default().fg(theme.header_fg).add_modifier(Modifier::BOLD));
+
+    let active_idx = match state.active_pane {
+        ActivePane::Sidebar => 0,
+        ActivePane::SqlConsole => 1,
+        ActivePane::QueryResults => if state.bi_mode_enabled { 2 } else { 1 },
+        ActivePane::RelatedDataList | ActivePane::RelatedDataGrid => if state.bi_mode_enabled { 2 } else { 1 },
+        ActivePane::ModalEditor => if state.bi_mode_enabled { 2 } else { 1 },
+        ActivePane::EngineSelector => 0,
+    };
+
+    let tabs = ratatui::widgets::Tabs::new(tabs_titles)
+        .block(block)
+        .select(active_idx)
+        .style(Style::default().fg(theme.text_secondary))
+        .highlight_style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+                .add_modifier(Modifier::UNDERLINED),
+        );
+
+    f.render_widget(tabs, area);
+}
+
+/// A horizontal row of clickable action buttons. Each button registers its
+/// rect in `state.toolbar_buttons` so `handle_mouse_click` can dispatch it.
+fn draw_action_toolbar(f: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) {
+    state.toolbar_buttons.clear();
+
+    let is_relational = matches!(
+        state.active_engine,
+        ActiveEngine::MariaDb | ActiveEngine::PostgreSql | ActiveEngine::Sqlite
+    );
+
+    let mut actions: Vec<ToolbarAction> = vec![ToolbarAction::Search, ToolbarAction::Describe];
+    if is_relational {
+        actions.push(ToolbarAction::Trace);
+        actions.push(ToolbarAction::Edit);
+        actions.push(ToolbarAction::Add);
+        actions.push(ToolbarAction::Delete);
+    }
+    actions.push(ToolbarAction::Refresh);
+    if state.bi_chartable {
+        actions.push(ToolbarAction::ToggleChart);
+    }
+    if is_relational {
+        actions.push(ToolbarAction::ToggleRelated);
+    }
+    actions.push(ToolbarAction::Databases);
+    if !state.exploration_history.is_empty() {
+        actions.push(ToolbarAction::Back);
+    }
+    actions.push(ToolbarAction::Disconnect);
+
+    let mut spans: Vec<Span> = Vec::new();
+    let mut x = area.x;
+    for action in actions {
+        let text = format!(" {} {} ", action.label(), action.shortcut());
+        let w = text.chars().count() as u16;
+        if x + w + 1 >= area.x + area.width {
+            break; // ran out of horizontal space
+        }
+
+        // Danger actions get a red button; the chart toggle lights up when on.
+        let (bg, fg) = match action {
+            ToolbarAction::Delete | ToolbarAction::Disconnect => (theme.danger, Color::Black),
+            ToolbarAction::ToggleChart if state.bi_mode_enabled => (theme.success, Color::Black),
+            ToolbarAction::Back => (theme.header_fg, Color::Black),
+            _ => (theme.accent, Color::Black),
+        };
+        spans.push(Span::styled(
+            text,
+            Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::raw(" "));
+
+        state
+            .toolbar_buttons
+            .push((Rect { x, y: area.y, width: w, height: 1 }, action));
+        x += w + 1;
+    }
+
+    f.render_widget(
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(Color::Rgb(30, 31, 43))),
+        area,
+    );
+}
+
+fn draw_workspace(f: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) {
+    let workspace_layout = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(25), // Sidebar list
+            Constraint::Percentage(75), // Details / Grid View
+        ])
+        .split(area);
+
+    draw_sidebar(f, workspace_layout[0], state, theme);
+    state.rect_sidebar = Some(workspace_layout[0]);
+
+    if state.bi_mode_enabled && state.bi_chartable {
+        state.rect_related_split = None;
+        state.rect_data_view = None;
+        state.rect_query_bar = None;
+        draw_bi_dashboard(f, workspace_layout[1], state, theme);
+    } else {
+        draw_data_details(f, workspace_layout[1], state, theme);
+    }
+}
+
+fn draw_data_details(f: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) {
+    let is_focused = state.active_pane == ActivePane::QueryResults;
+    let block = get_pane_block(" DATA VIEW ", is_focused, theme);
+
+    let is_relational = state.active_engine == ActiveEngine::MariaDb
+        || state.active_engine == ActiveEngine::PostgreSql
+        || state.active_engine == ActiveEngine::Sqlite;
+
+    if !state.show_related_split || !is_relational || state.relationships.is_empty() {
+        state.rect_related_split = None;
+        state.rect_data_view = Some(area);
+        draw_main_details_grid(f, area, state, theme, block);
+    } else {
+        let splits = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Percentage(60), // Main table grid
+                Constraint::Percentage(40), // Parent/Child records
+            ])
+            .split(area);
+
+        state.rect_data_view = Some(splits[0]);
+        state.rect_related_split = Some(splits[1]);
+
+        draw_main_details_grid(f, splits[0], state, theme, block);
+        draw_related_data_split(f, splits[1], state, theme);
+    }
+}
+
+fn draw_sidebar(f: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) {
+    let is_focused = state.active_pane == ActivePane::Sidebar;
+
+    if state.show_db_list {
+        let block = get_pane_block(" DATABASES/SCHEMAS (Esc/d: Back) ", is_focused, theme);
+        let items: Vec<ListItem> = state
+            .databases
+            .iter()
+            .enumerate()
+            .map(|(idx, db)| {
+                let active = state.selected_db_idx == Some(idx);
+                let style = if active {
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(theme.text_primary)
+                };
+                ListItem::new(format!("  {} {}", if active { "🔘" } else { "  " }, db)).style(style)
+            })
+            .collect();
+            
+        let list = List::new(items).block(block);
+        let mut list_state = ListState::default();
+        list_state.select(state.selected_db_idx);
+        f.render_stateful_widget(list, area, &mut list_state);
+    } else {
+        let sidebar_title = match state.active_engine {
+            ActiveEngine::MongoDb => " COLLECTIONS (d: Switch DB) ",
+            ActiveEngine::Neo4j => " LABELS (d: Switch DB) ",
+            _ => " TABLES (d: Switch DB) ",
+        };
+        let block = get_pane_block(sidebar_title, is_focused, theme);
+
+        let items: Vec<ListItem> = state
+            .tables
+            .iter()
+            .enumerate()
+            .map(|(idx, table)| {
+                let active = state.selected_table_idx == Some(idx);
+                let style = if active {
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(theme.text_primary)
+                };
+                ListItem::new(format!("  {} {}", if active { "🔘" } else { "  " }, table)).style(style)
+            })
+            .collect();
+
+        let list = List::new(items).block(block);
+        let mut list_state = ListState::default();
+        list_state.select(state.selected_table_idx);
+        f.render_stateful_widget(list, area, &mut list_state);
+    }
+}
+
+// Subtle alternating-row (zebra) background for readability.
+const ZEBRA_BG: Color = Color::Rgb(40, 42, 54);
+const SELECTED_BG: Color = Color::Rgb(58, 62, 90);
+const HEADER_BG: Color = Color::Rgb(49, 50, 68);
+
+/// Render the always-visible "active query" bar above the data grid.
+fn draw_query_bar(f: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) {
+    state.rect_query_bar = Some(area);
+    let shown = if !state.last_executed_query.trim().is_empty() {
+        state.last_executed_query.clone()
+    } else if !state.sql_console_input.trim().is_empty() {
+        state.sql_console_input.clone()
+    } else {
+        "(no query yet — pick a table or type one in [2] SQL Console)".to_string()
+    };
+    let line = Line::from(vec![
+        Span::styled(" query ", Style::default().fg(Color::Black).bg(theme.accent).add_modifier(Modifier::BOLD)),
+        Span::raw(" "),
+        Span::styled(shown, Style::default().fg(theme.text_primary)),
+    ]);
+    f.render_widget(Paragraph::new(line), area);
+}
+
+/// Render the in-grid searcher bar (only when active or a filter is set).
+fn draw_search_bar(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme, match_count: usize, total: usize) {
+    let cursor = if state.search_active { "█" } else { "" };
+    let tag_style = if state.search_active {
+        Style::default().fg(Color::Black).bg(theme.header_fg).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Black).bg(theme.text_secondary).add_modifier(Modifier::BOLD)
+    };
+    let line = Line::from(vec![
+        Span::styled(" search / ", tag_style),
+        Span::raw(" "),
+        Span::styled(format!("{}{}", state.search_query, cursor), Style::default().fg(theme.header_fg)),
+        Span::styled(
+            format!("   {} / {} rows match", match_count, total),
+            Style::default().fg(theme.text_secondary),
+        ),
+        Span::styled("   (Esc clear)", Style::default().fg(theme.border_inactive)),
+    ]);
+    f.render_widget(Paragraph::new(line), area);
+}
+
+fn draw_main_details_grid(f: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme, block: Block<'static>) {
+    // Carve out: query bar (always) + optional search bar + the grid/tree itself.
+    let show_search = state.search_active || !state.search_query.is_empty();
+    let mut constraints = vec![Constraint::Length(1)];
+    if show_search {
+        constraints.push(Constraint::Length(1));
+    }
+    constraints.push(Constraint::Min(1));
+    let zones = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(area);
+    let query_zone = zones[0];
+    let (search_zone, grid_zone) = if show_search {
+        (Some(zones[1]), zones[2])
+    } else {
+        (None, zones[1])
+    };
+
+    draw_query_bar(f, query_zone, state, theme);
+    // The clickable data area is the grid zone, not the whole pane (keeps mouse aligned).
+    state.rect_data_view = Some(grid_zone);
+
+    // If document engine (MongoDB/JSON), render as tree view
+    let is_dbf = state.active_engine == ActiveEngine::LocalJson && state.conn_fields.json_path.ends_with(".dbf");
+    if (state.active_engine == ActiveEngine::MongoDb || state.active_engine == ActiveEngine::LocalJson) && !is_dbf {
+        if let Some(sz) = search_zone {
+            draw_search_bar(f, sz, state, theme, state.flat_tree_rows.len(), state.flat_tree_rows.len());
+        }
+        if state.flat_tree_rows.is_empty() {
+            let empty_msg = Paragraph::new("\n  Query returned 0 documents / Execute a filter to list records.")
+                .block(block)
+                .style(Style::default().fg(theme.text_secondary));
+            f.render_widget(empty_msg, grid_zone);
+            return;
+        }
+
+        let items: Vec<ListItem> = state
+            .flat_tree_rows
+            .iter()
+            .enumerate()
+            .map(|(idx, row)| {
+                let is_selected = state.selected_tree_row_idx == Some(idx);
+                let mut style = Style::default().fg(theme.text_primary);
+                if is_selected {
+                    style = style.bg(SELECTED_BG).fg(theme.border_active).add_modifier(Modifier::BOLD);
+                }
+
+                let line_str = &row.display_text;
+                let spans = if line_str.contains(':') {
+                    let parts: Vec<&str> = line_str.splitn(2, ':').collect();
+                    vec![
+                        Span::styled(parts[0].to_string(), Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+                        Span::raw(":"),
+                        Span::styled(parts[1].to_string(), Style::default().fg(theme.text_primary)),
+                    ]
+                } else {
+                    vec![Span::raw(line_str.clone())]
+                };
+
+                ListItem::new(Line::from(spans)).style(style)
+            })
+            .collect();
+
+        let list = List::new(items).block(block);
+        let mut list_state = ListState::default();
+        list_state.select(state.selected_tree_row_idx);
+        f.render_stateful_widget(list, grid_zone, &mut list_state);
+        return;
+    }
+
+    // Relational Grid/Table View
+    if state.result_rows.is_empty() {
+        if let Some(sz) = search_zone {
+            draw_search_bar(f, sz, state, theme, 0, 0);
+        }
+        let empty_msg = Paragraph::new("\n  No records found / Run a SELECT query to pull data.")
+            .block(block)
+            .style(Style::default().fg(theme.text_secondary));
+        f.render_widget(empty_msg, grid_zone);
+        return;
+    }
+
+    let total_cols = state.result_headers.len();
+    state.selected_col_idx = state.selected_col_idx.min(total_cols.saturating_sub(1));
+
+    // Only build rows that pass the search filter; remember their original index
+    // so selection/highlight stays correct relative to `result_rows`.
+    let visible_indices = state.visible_row_indices();
+    let match_count = visible_indices.len();
+
+    if let Some(sz) = search_zone {
+        draw_search_bar(f, sz, state, theme, match_count, state.result_rows.len());
+    }
+
+    // lazysql-style layout: each column as wide as its widest visible value
+    // (clamped), packing as many columns as fit from the scroll offset.
+    let all_widths: Vec<u16> = (0..total_cols)
+        .map(|c| {
+            let mut w = state.result_headers[c].chars().count();
+            for &ri in &visible_indices {
+                if let Some(v) = state.result_rows[ri].get(c) {
+                    w = w.max(v.chars().count());
+                }
+            }
+            w.clamp(4, 28) as u16 + 1 // +1 for the leading-space padding
+        })
+        .collect();
+    let avail = grid_zone.width.saturating_sub(3); // borders + highlight symbol
+    let fit_from = |off: usize| -> usize {
+        let mut used: u16 = 0;
+        let mut n = 0;
+        for c in off..total_cols {
+            let w = all_widths[c] + 1; // + column spacing
+            if used + w > avail {
+                break;
+            }
+            used += w;
+            n += 1;
+        }
+        n.max(1)
+    };
+
+    // Keep the cell cursor inside the visible column window.
+    if state.selected_col_idx < state.col_scroll_offset {
+        state.col_scroll_offset = state.selected_col_idx;
+    }
+    while state.selected_col_idx >= state.col_scroll_offset + fit_from(state.col_scroll_offset) {
+        state.col_scroll_offset += 1;
+    }
+    let offset = state.col_scroll_offset.min(total_cols.saturating_sub(1));
+    let visible_count = fit_from(offset);
+
+    let widths: Vec<Constraint> = (offset..offset + visible_count)
+        .map(|c| Constraint::Length(all_widths[c]))
+        .collect();
+
+    let header_cells = (offset..offset + visible_count).map(|c| {
+        let style = if c == state.selected_col_idx {
+            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        } else {
+            Style::default().fg(theme.header_fg).add_modifier(Modifier::BOLD)
+        };
+        ratatui::widgets::Cell::from(format!(" {}", state.result_headers[c])).style(style)
+    });
+    let header = Row::new(header_cells)
+        .height(1)
+        .bottom_margin(1)
+        .style(Style::default().bg(HEADER_BG));
+
+    let rows: Vec<Row> = visible_indices
+        .iter()
+        .enumerate()
+        .map(|(vis_pos, &orig_idx)| {
+            let row_cells = &state.result_rows[orig_idx];
+            let is_selected = state.selected_row_idx == Some(orig_idx);
+            let cells = (offset..offset + visible_count).map(|c| {
+                let val = row_cells.get(c).map(|s| s.as_str()).unwrap_or("");
+                let cell_style = if is_selected && c == state.selected_col_idx {
+                    // The cell cursor.
+                    Style::default().fg(Color::Black).bg(theme.accent).add_modifier(Modifier::BOLD)
+                } else if val == "NULL" {
+                    Style::default().fg(theme.border_inactive).add_modifier(Modifier::ITALIC)
+                } else {
+                    Style::default().fg(theme.text_primary)
+                };
+                ratatui::widgets::Cell::from(format!(" {}", val)).style(cell_style)
+            });
+            let row = Row::new(cells).height(1);
+            if is_selected {
+                row.style(Style::default().bg(SELECTED_BG).add_modifier(Modifier::BOLD))
+            } else if vis_pos % 2 == 1 {
+                row.style(Style::default().bg(ZEBRA_BG))
+            } else {
+                row
+            }
+        })
+        .collect();
+
+    // Position of the selected row within the filtered list (for scroll-into-view).
+    let selected_vis_pos = state
+        .selected_row_idx
+        .and_then(|sel| visible_indices.iter().position(|&i| i == sel));
+
+    let col_indicator = if total_cols > visible_count {
+        format!(
+            " · col {}/{} ({}) ◀▶",
+            state.selected_col_idx + 1,
+            total_cols,
+            state.result_headers.get(state.selected_col_idx).cloned().unwrap_or_default()
+        )
+    } else {
+        String::new()
+    };
+    let row_indicator = match selected_vis_pos {
+        Some(p) => format!(" · row {}/{}", p + 1, match_count),
+        None => format!(" · {} rows", match_count),
+    };
+    let filter_indicator = if !state.search_query.is_empty() {
+        format!(" · filtered from {}", state.result_rows.len())
+    } else {
+        String::new()
+    };
+    let focused_grid = state.active_pane == ActivePane::QueryResults;
+    let final_block = get_pane_block(
+        &format!("DATA VIEW{}{}{} · ⏎ record", row_indicator, col_indicator, filter_indicator),
+        focused_grid,
+        theme,
+    );
+
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(final_block)
+        .highlight_style(Style::default().bg(SELECTED_BG))
+        .highlight_symbol("▎");
+
+    let mut table_state = ratatui::widgets::TableState::default();
+    table_state.select(selected_vis_pos);
+
+    f.render_stateful_widget(table, grid_zone, &mut table_state);
+}
+
+fn draw_related_data_split(f: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) {
+    if state.relationships.is_empty() {
+        state.rect_related_list = None;
+        state.rect_related_grid = None;
+        return;
+    }
+
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(30), // List of joins/relationships
+            Constraint::Percentage(70), // Table of matching rows
+        ])
+        .split(area);
+
+    state.rect_related_list = Some(columns[0]);
+    state.rect_related_grid = Some(columns[1]);
+
+    // 1. Draw Left Pane: List of relations
+    let is_list_focused = state.active_pane == ActivePane::RelatedDataList;
+    let list_block = get_pane_block(" Joins List (Up/Down) ", is_list_focused, theme);
+    
+    let items: Vec<ListItem> = state
+        .relationships
+        .iter()
+        .enumerate()
+        .map(|(idx, rel)| {
+            let rel_type = if rel.is_parent { "parent" } else { "child" };
+            let text = format!("{} ({}: {})", rel.target_table, rel_type, rel.active_col);
+            let style = if state.active_relationship_idx == idx {
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.text_primary)
+            };
+            ListItem::new(text).style(style)
+        })
+        .collect();
+
+    let list = List::new(items)
+        .block(list_block)
+        .highlight_style(Style::default().bg(Color::Rgb(49, 50, 68)))
+        .highlight_symbol("> ");
+
+    let mut list_state = ListState::default();
+    list_state.select(Some(state.active_relationship_idx));
+    f.render_stateful_widget(list, columns[0], &mut list_state);
+
+    // 2. Draw Right Pane: Matching rows table
+    let is_grid_focused = state.active_pane == ActivePane::RelatedDataGrid;
+    
+    if state.related_rows.is_empty() {
+        let grid_block = get_pane_block(" Matching Rows ", is_grid_focused, theme);
+        let no_data_msg = if state.related_loading {
+            "Loading referenced records... Please wait."
+        } else {
+            "No matching related records found."
+        };
+        let empty_para = Paragraph::new(format!("\n  {}", no_data_msg))
+            .block(grid_block)
+            .style(Style::default().fg(theme.text_secondary));
+        f.render_widget(empty_para, columns[1]);
+        return;
+    }
+
+    let total_cols = state.related_headers.len();
+    let offset = state.related_col_scroll_offset.min(total_cols);
+    let visible_headers = &state.related_headers[offset..];
+
+    let max_visible_cols = (columns[1].width / 18) as usize;
+    let max_visible_cols = max_visible_cols.max(1);
+    let visible_count = visible_headers.len().min(max_visible_cols);
+    let sliced_headers = &visible_headers[0..visible_count];
+
+    let widths = vec![Constraint::Percentage(100 / visible_count.max(1) as u16); visible_count];
+
+    let header_cells = sliced_headers
+        .iter()
+        .map(|h| ratatui::widgets::Cell::from(h.as_str()).style(Style::default().fg(theme.header_fg).add_modifier(Modifier::BOLD)));
+    let header = Row::new(header_cells).height(1).bottom_margin(1);
+
+    let rows: Vec<Row> = state
+        .related_rows
+        .iter()
+        .enumerate()
+        .map(|(idx, row_cells)| {
+            let offset_cells = &row_cells[offset.min(row_cells.len())..];
+            let visible_cells = &offset_cells[0..visible_count.min(offset_cells.len())];
+            let cells = visible_cells.iter().map(|c| ratatui::widgets::Cell::from(c.as_str()).style(Style::default().fg(theme.text_primary)));
+            let is_selected = state.related_selected_row_idx == Some(idx);
+            let row = Row::new(cells).height(1);
+            if is_selected {
+                row.style(Style::default().bg(Color::Rgb(49, 50, 68)).fg(theme.border_active).add_modifier(Modifier::BOLD))
+            } else {
+                row
+            }
+        })
+        .collect();
+
+    let scroll_indicator = if total_cols > visible_count {
+        format!(" (Col {}/{} ◀/▶)", offset + 1, total_cols)
+    } else {
+        "".to_string()
+    };
+
+    let grid_block = get_pane_block(
+        &format!(" Matching Rows{} (Up/Down to scroll, Tab to switch) ", scroll_indicator),
+        is_grid_focused,
+        theme
+    );
+
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(grid_block)
+        .highlight_style(Style::default().bg(Color::Rgb(49, 50, 68)))
+        .highlight_symbol("> ");
+
+    let mut table_state = ratatui::widgets::TableState::default();
+    table_state.select(state.related_selected_row_idx);
+
+    f.render_stateful_widget(table, columns[1], &mut table_state);
+}
+
+fn draw_bi_dashboard(f: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) {
+    let is_focused = state.active_pane == ActivePane::QueryResults;
+    let outer_block = get_pane_block(" BI DYNAMIC PIVOT PANEL (1/2/3 to switch tabs) ", is_focused, theme);
+    f.render_widget(outer_block.clone(), area);
+    
+    let inner_area = outer_block.inner(area);
+    
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(35), // Left: Configurator
+            Constraint::Percentage(65), // Right: Pivot Table & Charts
+        ])
+        .split(inner_area);
+        
+    state.rect_bi_config = Some(chunks[0]);
+    state.rect_bi_pivot = Some(chunks[1]);
+
+    // 1. Left Configurator Block
+    let config_block = Block::bordered()
+        .title(" CONFIGURATOR (Up/Down to select, Left/Right to change) ")
+        .border_style(Style::default().fg(theme.border_inactive));
+    let config_area = config_block.inner(chunks[0]);
+    f.render_widget(config_block, chunks[0]);
+    
+    let num_cols = if state.pivot_state.config.bi_source_related {
+        state.related_headers.len()
+    } else {
+        state.result_headers.len()
+    };
+    
+    // Helper to get column name
+    let get_col_name = |idx_opt: Option<usize>| -> String {
+        match idx_opt {
+            Some(idx) => {
+                if idx < num_cols {
+                    if state.pivot_state.config.bi_source_related {
+                        state.related_headers[idx].clone()
+                    } else {
+                        state.result_headers[idx].clone()
+                    }
+                } else {
+                    "[ INVALID ]".to_string()
+                }
+            }
+            None => "[ NONE / Count All ]".to_string(),
+        }
+    };
+
+    let get_filter_col_name = |idx_opt: Option<usize>| -> String {
+        match idx_opt {
+            Some(idx) => {
+                if idx < num_cols {
+                    if state.pivot_state.config.bi_source_related {
+                        state.related_headers[idx].clone()
+                    } else {
+                        state.result_headers[idx].clone()
+                    }
+                } else {
+                    "[ INVALID ]".to_string()
+                }
+            }
+            None => "[ NO FILTER ]".to_string(),
+        }
+    };
+    
+    let active_idx = state.pivot_state.active_selector_idx;
+    
+    let rows_str = get_col_name(state.pivot_state.config.row_dimension_idx);
+    let cols_str = get_col_name(state.pivot_state.config.col_dimension_idx);
+    let vals_str = get_col_name(state.pivot_state.config.value_column_idx);
+    let agg_str = state.pivot_state.config.agg_fn.label().to_string();
+    let filter_col_str = get_filter_col_name(state.pivot_state.config.filter_col_idx);
+    let filter_op_str = state.pivot_state.config.filter_op.clone();
+    let filter_val_str = if active_idx == 6 {
+        format!("{}█", state.pivot_state.filter_text_input) // cursor indicator
+    } else {
+        state.pivot_state.config.filter_val.clone()
+    };
+    let chart_str = state.pivot_state.config.chart_type.label().to_string();
+    let auto_recalc_str = if state.pivot_state.config.auto_recalc {
+        "[X] Automatic (Real-time)"
+    } else {
+        "[ ] Manual (Ctrl+X to run)"
+    }.to_string();
+    let rate_base_str = get_col_name(state.pivot_state.config.rate_base_column_idx);
+    let bi_source_str = if state.pivot_state.config.bi_source_related {
+        "Related Table (Parent/Child Split)"
+    } else {
+        "Main Table (Grid Query Results)"
+    }.to_string();
+    
+    let items = vec![
+        ("Rows (Dimension)", rows_str),
+        ("Columns (Dimension)", cols_str),
+        ("Values (Measure)", vals_str),
+        ("Aggr. Function", agg_str),
+        ("Filter Column", filter_col_str),
+        ("Filter Operator", filter_op_str),
+        ("Filter Value", filter_val_str),
+        ("Chart Representation", chart_str),
+        ("Recalculate Mode", auto_recalc_str),
+        ("Rate Base Column (Denom.)", rate_base_str),
+        ("BI Data Source", bi_source_str),
+    ];
+    
+    let config_splits = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(22), // 11 items * 2 lines each
+            Constraint::Min(5),    // Verbose Statistics Summary box
+        ])
+        .split(config_area);
+
+    let config_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(vec![
+            Constraint::Length(2),
+            Constraint::Length(2),
+            Constraint::Length(2),
+            Constraint::Length(2),
+            Constraint::Length(2),
+            Constraint::Length(2),
+            Constraint::Length(2),
+            Constraint::Length(2),
+            Constraint::Length(2),
+            Constraint::Length(2),
+            Constraint::Length(2),
+        ])
+        .split(config_splits[0]);
+        
+    for (i, (label, value)) in items.iter().enumerate() {
+        let is_active = active_idx == i;
+        let style = if is_active {
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.text_secondary)
+        };
+        
+        let text = Line::from(vec![
+            Span::styled(format!(" {} : ", label), style),
+            Span::styled(value, Style::default().fg(theme.text_primary)),
+        ]);
+        
+        let border_style = if is_active {
+            Style::default().fg(theme.border_active)
+        } else {
+            Style::default().fg(theme.border_inactive)
+        };
+        let row_block = Block::default().borders(Borders::BOTTOM).border_style(border_style);
+        f.render_widget(Paragraph::new(text).block(row_block), config_layout[i]);
+    }
+
+    // Statistics Summary Box
+    let raw_rows_count = if state.pivot_state.config.bi_source_related {
+        state.related_rows.len()
+    } else {
+        state.result_rows.len()
+    };
+    let filtered_rows_count = state.pivot_state.pivot_rows.len().saturating_sub(1);
+    let cols_count = state.pivot_state.pivot_headers.len().saturating_sub(2);
+    let grand_total = state.pivot_state.pivot_rows.last().and_then(|row| row.last()).cloned().unwrap_or_else(|| "N/A".to_string());
+
+    let stats_block = Block::bordered()
+        .title(" BI Statistics Summary ")
+        .border_style(Style::default().fg(theme.border_inactive));
+    
+    let stats_text = vec![
+        Line::from(vec![
+            Span::styled(" Raw Data Rows: ", Style::default().fg(theme.text_secondary)),
+            Span::styled(format!("{}", raw_rows_count), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(vec![
+            Span::styled(" Rows after Filter: ", Style::default().fg(theme.text_secondary)),
+            Span::styled(format!("{}", filtered_rows_count), Style::default().fg(theme.success)),
+        ]),
+        Line::from(vec![
+            Span::styled(" Column Categories: ", Style::default().fg(theme.text_secondary)),
+            Span::styled(format!("{}", cols_count), Style::default().fg(theme.accent)),
+        ]),
+        Line::from(vec![
+            Span::styled(" Grand Total Sum/Rate: ", Style::default().fg(theme.text_secondary)),
+            Span::styled(grand_total, Style::default().fg(theme.header_fg).add_modifier(Modifier::BOLD)),
+        ]),
+    ];
+    
+    let stats_para = Paragraph::new(stats_text).block(stats_block);
+    f.render_widget(stats_para, config_splits[1]);
+    
+    // 2. Right Pivot Result Panel
+    let result_block = Block::bordered()
+        .title(" PIVOT MATRIX / GRAPH VIEW ")
+        .border_style(Style::default().fg(theme.border_inactive));
+    let result_area = result_block.inner(chunks[1]);
+    f.render_widget(result_block, chunks[1]);
+    
+    if state.pivot_state.pivot_headers.is_empty() || state.pivot_state.pivot_rows.is_empty() {
+        let empty_msg = Paragraph::new("\n  No data to pivot. Configure rows/columns and values to build dynamic matrix.")
+            .style(Style::default().fg(theme.text_secondary));
+        f.render_widget(empty_msg, result_area);
+        return;
+    }
+    
+    // Depending on chart type, draw Table or Chart
+    match state.pivot_state.config.chart_type {
+        BiChartType::TableOnly => {
+            // Draw Table
+            let cols_count = state.pivot_state.pivot_headers.len();
+            let widths = vec![Constraint::Percentage(100 / cols_count as u16); cols_count];
+            
+            let header_cells = state.pivot_state.pivot_headers.iter().map(|h| {
+                ratatui::widgets::Cell::from(h.as_str()).style(Style::default().fg(theme.header_fg).add_modifier(Modifier::BOLD))
+            });
+            let header = Row::new(header_cells).height(1).bottom_margin(1);
+            
+            let rows: Vec<Row> = state.pivot_state.pivot_rows.iter().enumerate().map(|(r_idx, row_cells)| {
+                let is_grand_total_row = r_idx == state.pivot_state.pivot_rows.len() - 1;
+                
+                let cells = row_cells.iter().enumerate().map(|(c_idx, c)| {
+                    let is_grand_total_col = c_idx == row_cells.len() - 1;
+                    
+                    let style = if is_grand_total_row || is_grand_total_col {
+                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(theme.text_primary)
+                    };
+                    ratatui::widgets::Cell::from(c.as_str()).style(style)
+                });
+                
+                let row_style = if is_grand_total_row {
+                    Style::default().bg(Color::Rgb(49, 50, 68))
+                } else {
+                    Style::default()
+                };
+                
+                Row::new(cells).height(1).style(row_style)
+            }).collect();
+            
+            let table = Table::new(rows, widths)
+                .header(header)
+                .block(Block::default());
+            f.render_widget(table, result_area);
+        }
+        BiChartType::Bar => {
+            // Draw Bar Chart of pivot row totals
+            let bars: Vec<Bar> = state.pivot_state.pivot_chart_data.iter().map(|b| {
+                Bar::default()
+                    .value(b.value)
+                    .label(b.label.as_str().into())
+                    .style(Style::default().fg(theme.accent))
+                    .value_style(Style::default().fg(Color::Black).bg(theme.accent).add_modifier(Modifier::BOLD))
+            }).collect();
+            
+            let group = BarGroup::default().bars(&bars);
+            let barchart = BarChart::default()
+                .block(Block::default())
+                .data(group)
+                .bar_width(12)
+                .bar_gap(2)
+                .value_style(Style::default().fg(Color::Yellow))
+                .label_style(Style::default().fg(theme.text_secondary));
+            f.render_widget(barchart, result_area);
+        }
+        BiChartType::Sparkline => {
+            // Draw Sparkline of row values
+            let values: Vec<u64> = state.pivot_state.pivot_chart_data.iter().map(|b| b.value).collect();
+            let sparkline = Sparkline::default()
+                .block(Block::default())
+                .data(&values)
+                .style(Style::default().fg(theme.success));
+            f.render_widget(sparkline, result_area);
+        }
+    }
+}
+
+fn draw_sql_console(f: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) {
+    state.rect_sql_console = Some(area);
+
+    let is_focused = state.active_pane == ActivePane::SqlConsole;
+    let console_title = match state.active_engine {
+        ActiveEngine::MongoDb => " MONGO FILTER (collection|filter) ",
+        _ => " SQL QUERY CONSOLE (Press Enter to execute) ",
+    };
+    let block = get_pane_block(console_title, is_focused, theme);
+
+    let input_para = Paragraph::new(state.sql_console_input.as_str())
+        .block(block)
+        .style(Style::default().fg(theme.text_primary));
+    
+    f.render_widget(input_para, area);
+
+    if is_focused {
+        let cursor_x = area.x + state.sql_cursor_pos as u16 + 1;
+        let cursor_y = area.y + 1;
+        f.set_cursor(cursor_x, cursor_y);
+    }
+}
+
+fn draw_footer_status(f: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) {
+    let bar_layout = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(50), // Connection status/Breadcrumbs (Left)
+            Constraint::Percentage(50), // Keyboard shortcuts (Right)
+        ])
+        .split(area);
+
+    // Left Connection/History status
+    let status_style = if state.connecting {
+        Style::default().fg(theme.header_fg)
+    } else {
+        Style::default().fg(theme.success)
+    };
+
+    let active_db_indicator = if state.exploration_history.is_empty() {
+        format!(" ● Connection: {}", state.conn_status_msg)
+    } else {
+        let mut path = Vec::new();
+        for hist in &state.exploration_history {
+            if let Some(ref name) = hist.table_name {
+                path.push(name.clone());
+            }
+        }
+        if let Some(ref name) = state.active_table_name {
+            path.push(name.clone());
+        }
+        format!(" ➔ {}", path.join(" ➔ "))
+    };
+    let status_widget = Paragraph::new(active_db_indicator).style(status_style);
+    f.render_widget(status_widget, bar_layout[0]);
+
+    // Right keyboard hotkeys legend — contextual to the focused pane.
+    let shortcut_text = if state.search_active {
+        "type to filter · Enter: keep · Esc: clear".to_string()
+    } else {
+        match state.active_pane {
+            ActivePane::Sidebar => {
+                "↑↓: Move · Enter: Open · d: DBs · Tab: Next pane · Ctrl+Q: Quit".to_string()
+            }
+            ActivePane::SqlConsole => {
+                "type query · Enter: Run · Esc: Back · Tab: Next pane".to_string()
+            }
+            ActivePane::QueryResults => {
+                let mut s = String::from("↑↓: Rows · ◀▶: Cols · /: Search · i: Describe · e/a/d: Edit/Add/Del");
+                if state.bi_chartable {
+                    s.push_str(" · F6: BI");
+                }
+                if !state.exploration_history.is_empty() {
+                    s = format!("Backspace: Back · {}", s);
+                }
+                s
+            }
+            ActivePane::RelatedDataList => {
+                "↑↓: Joins · Enter/▶: Open · Backspace: Back · Esc: Grid".to_string()
+            }
+            ActivePane::RelatedDataGrid => {
+                "↑↓: Rows · Enter/G: Descend · Backspace: Back · ◀▶: Cols".to_string()
+            }
+            ActivePane::ModalEditor => "↑↓: Field · type value · Enter: Save · Esc: Cancel".to_string(),
+            ActivePane::EngineSelector => "F2/F3/F4: Mode · ◀▶: Engine · Enter: Connect".to_string(),
+        }
+    };
+    let legend = Paragraph::new(shortcut_text)
+        .alignment(ratatui::layout::Alignment::Right)
+        .style(Style::default().fg(theme.text_secondary));
+    f.render_widget(legend, bar_layout[1]);
+}
+
+fn draw_row_editor_modal(f: &mut Frame, container_area: Rect, state: &mut AppState, theme: &Theme) {
+    let modal_area = get_centered_rect(70, 70, container_area);
+    f.render_widget(Clear, modal_area);
+
+    let title = if state.show_edit_modal {
+        " [ EDIT ROW ] "
+    } else {
+        " [ INSERT ROW ] "
+    };
+
+    let block = Block::bordered()
+        .title(title)
+        .title_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+        .border_style(Style::default().fg(theme.border_active))
+        .bg(Color::Black);
+    f.render_widget(block.clone(), modal_area);
+
+    let inner_area = block.inner(modal_area);
+
+    let len = state.modal_fields.len();
+    if len == 0 {
+        return;
+    }
+
+    let max_visible_fields = 8;
+    let active_idx = state.active_modal_field_idx;
+    let start_idx = if active_idx >= max_visible_fields {
+        active_idx - max_visible_fields + 1
+    } else {
+        0
+    };
+    let end_idx = (start_idx + max_visible_fields).min(len);
+
+    let visible_len = end_idx - start_idx;
+    let constraints = vec![Constraint::Length(2); visible_len];
+    let fields_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(inner_area);
+
+    for idx in start_idx..end_idx {
+        let field_layout_idx = idx - start_idx;
+        let (col_name, col_val) = &state.modal_fields[idx];
+        let is_active = active_idx == idx;
+
+        let label_style = if is_active {
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.text_secondary)
+        };
+
+        let label_text = format!(" {} : ", col_name);
+        let input_line = Line::from(vec![
+            Span::styled(label_text, label_style),
+            Span::styled(col_val, Style::default().fg(theme.text_primary)),
+        ]);
+
+        let block_style = if is_active {
+            Style::default().fg(theme.border_active)
+        } else {
+            Style::default().fg(theme.border_inactive)
+        };
+        let row_block = Block::default().borders(Borders::BOTTOM).border_style(block_style);
+        f.render_widget(Paragraph::new(input_line).block(row_block), fields_layout[field_layout_idx]);
+
+        if is_active && state.active_pane == ActivePane::ModalEditor {
+            let label_len = col_name.len() as u16 + 4;
+            let cursor_x = fields_layout[field_layout_idx].x + label_len + col_val.len() as u16;
+            let cursor_y = fields_layout[field_layout_idx].y;
+            f.set_cursor(cursor_x, cursor_y);
+        }
+    }
+}
+
+fn draw_delete_confirm_modal(f: &mut Frame, container_area: Rect, state: &mut AppState, theme: &Theme) {
+    let modal_area = get_centered_rect(50, 25, container_area);
+    f.render_widget(Clear, modal_area);
+
+    let block = Block::bordered()
+        .title(" [ CONFIRM DELETE ] ")
+        .title_style(Style::default().fg(theme.danger).add_modifier(Modifier::BOLD))
+        .border_style(Style::default().fg(theme.danger))
+        .bg(Color::Black);
+
+    let pk_desc = if let Some(ref pk) = state.primary_key {
+        let val = state.selected_row_pk_val.as_ref().map(|x| x.as_str()).unwrap_or("???");
+        format!("(Row identified by PK {} = '{}')", pk, val)
+    } else {
+        "(Warning: No Primary Key detected! Delete may fail or affect multiple rows.)".to_string()
+    };
+
+    let prompt_text = format!(
+        "\n  Are you sure you want to delete this row?\n  {}\n\n  Press [Enter] to Delete, [Esc] to Cancel.",
+        pk_desc
+    );
+
+    let paragraph = Paragraph::new(prompt_text)
+        .block(block)
+        .style(Style::default().fg(theme.text_primary))
+        .wrap(Wrap { trim: true });
+
+    f.render_widget(paragraph, modal_area);
+}

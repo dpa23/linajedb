@@ -1,0 +1,9 @@
+# CTSP: ID|ASSIGN|STATE|SUMMARY
+T1|AG|CO|rel_tree_nav_impl
+T2|AG|CO|activity_log_ctsp_setup
+T3|CC|IP|verify_sqlite_pg_data
+T4|OP|PL|breadcrumbs_color_theme
+
+# NOTES
+AG: implemented state-navigation in app.rs, ui.rs and main.rs. compiled and verified successfully.
+AG: created global orquestador-estado skill using CTSP token-saving protocol.
