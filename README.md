@@ -59,6 +59,26 @@ flowchart LR
     DISPATCH -- DbResponse --> CLI
 ```
 
+## Descarga
+
+Tres formas de obtener el proyecto:
+
+1. Con git:
+
+   ```bash
+   git clone https://github.com/dpa23/linajedb.git
+   ```
+
+2. Sin git: en https://github.com/dpa23/linajedb usar el botón
+   "Code" > "Download ZIP" y descomprimir.
+
+3. Compilar e instalar directo desde GitHub en un solo comando (deja el
+   binario `linajedb` en `~/.cargo/bin`, ya incluido en el PATH por rustup):
+
+   ```bash
+   cargo install --git https://github.com/dpa23/linajedb.git
+   ```
+
 ## Instalación
 
 Requiere la toolchain de Rust (https://rustup.rs). No hace falta instalar
@@ -73,6 +93,8 @@ git clone https://github.com/dpa23/linajedb.git
 cd linajedb
 cargo build --release
 # binario: target/release/linajedb
+# opcional: instalarlo en el PATH del usuario (~/.cargo/bin)
+cargo install --path .
 ```
 
 ### Windows

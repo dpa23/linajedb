@@ -245,7 +245,6 @@ pub struct TreeItem {
 pub struct FlatTreeRow {
     pub display_text: String,
     pub path: Vec<String>,
-    pub depth: usize,
 }
 
 impl TreeItem {
@@ -268,7 +267,6 @@ impl TreeItem {
                 indent = self.depth * 2
             ),
             path: self.path.clone(),
-            depth: self.depth,
         });
 
         if self.is_expanded {
@@ -313,7 +311,6 @@ pub struct AppState {
     // Sidebar databases/schemas list
     pub databases: Vec<String>,
     pub selected_db_idx: Option<usize>,
-    pub active_db_name: Option<String>,
     pub show_db_list: bool,
 
     // Console
@@ -384,8 +381,6 @@ pub struct AppState {
     pub active_modal_field_idx: usize,
     pub selected_row_pk_val: Option<String>,
 
-    // Spinner/Tick count for loader
-    pub tick_count: usize,
     pub mutation_in_progress: Option<String>,
 
     pub col_scroll_offset: usize,
@@ -458,7 +453,6 @@ impl AppState {
             active_table_name: None,
             databases: vec![],
             selected_db_idx: None,
-            active_db_name: None,
             show_db_list: false,
             sql_console_input: String::new(),
             sql_cursor_pos: 0,
@@ -526,7 +520,6 @@ impl AppState {
             modal_fields: vec![],
             active_modal_field_idx: 0,
             selected_row_pk_val: None,
-            tick_count: 0,
             mutation_in_progress: None,
             col_scroll_offset: 0,
             related_col_scroll_offset: 0,
