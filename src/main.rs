@@ -1,5 +1,6 @@
 mod app;
 mod db;
+mod headless;
 mod ui;
 
 use app::{ActiveEngine, ActivePane, AppState, ConnectionMode, FormField, ExplorationState};
@@ -80,6 +81,16 @@ fn extract_active_table(query: &str, engine: ActiveEngine) -> Option<String> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Headless subcommands (for scripts/AI agents) run before any terminal setup.
+    let cli_args: Vec<String> = std::env::args().skip(1).collect();
+    if cli_args.first().map(|s| s.as_str()) == Some("trace") {
+        if let Err(msg) = headless::run_trace(&cli_args[1..]).await {
+            eprintln!("{}", msg);
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
     // Setup terminal and alternate screen
     enable_raw_mode()?;
     let mut stdout = io::stdout();
