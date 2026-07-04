@@ -123,11 +123,107 @@ pub fn draw_ui(f: &mut Frame, state: &mut AppState) {
         draw_row_editor_modal(f, size, state, &theme);
     } else if state.show_delete_confirm {
         draw_delete_confirm_modal(f, size, state, &theme);
+    } else if state.show_row_detail {
+        draw_row_detail_modal(f, size, state, &theme);
     } else if state.show_trace {
         draw_trace_modal(f, size, state, &theme);
     } else if state.show_describe {
         draw_describe_modal(f, size, state, &theme);
     }
+}
+
+/// lazysql-style record view: the selected row as a column/value list with
+/// full (wrapped) values, for rows too wide to read in the grid.
+fn draw_row_detail_modal(f: &mut Frame, container_area: Rect, state: &mut AppState, theme: &Theme) {
+    let modal_area = get_centered_rect(70, 75, container_area);
+    f.render_widget(Clear, modal_area);
+    state.rect_row_detail = Some(modal_area);
+
+    let table_label = state.active_table_name.clone().unwrap_or_else(|| "result set".to_string());
+    let row_pos = state.selected_row_idx.map(|i| i + 1).unwrap_or(0);
+    let title = format!(" RECORD: {}  ·  row {}/{} ", table_label, row_pos, state.result_rows.len());
+    let block = get_pane_block(&title, true, theme).bg(Color::Black);
+    f.render_widget(block.clone(), modal_area);
+    let inner = block.inner(modal_area);
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(1)])
+        .split(inner);
+
+    let row = state
+        .selected_row_idx
+        .and_then(|i| state.result_rows.get(i))
+        .cloned()
+        .unwrap_or_default();
+
+    // Manual wrapping so the scroll clamp knows the exact line count:
+    // "  column ┆ value", continuation lines indented under the value column.
+    let key_w = state
+        .result_headers
+        .iter()
+        .map(|h| h.chars().count())
+        .max()
+        .unwrap_or(6)
+        .min(28);
+    let val_w = (layout[0].width as usize).saturating_sub(key_w + 6).max(10);
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (c, header) in state.result_headers.iter().enumerate() {
+        let val = row.get(c).map(|s| s.as_str()).unwrap_or("");
+        let is_cursor_col = c == state.selected_col_idx;
+        let key_style = if is_cursor_col {
+            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        } else {
+            Style::default().fg(theme.accent)
+        };
+        let val_style = if val == "NULL" {
+            Style::default().fg(theme.border_inactive).add_modifier(Modifier::ITALIC)
+        } else {
+            Style::default().fg(theme.text_primary)
+        };
+
+        let chars: Vec<char> = val.chars().collect();
+        let mut first = true;
+        let mut start = 0;
+        while start < chars.len() || first {
+            let end = (start + val_w).min(chars.len());
+            let chunk: String = chars[start..end].iter().collect();
+            let key_part = if first {
+                format!("  {:>key_w$} ┆ ", header.chars().take(key_w).collect::<String>(), key_w = key_w)
+            } else {
+                format!("  {:>key_w$} ┆ ", "", key_w = key_w)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(key_part, key_style),
+                Span::styled(chunk, val_style),
+            ]));
+            first = false;
+            start = end;
+            if start >= chars.len() {
+                break;
+            }
+        }
+    }
+
+    state.row_detail_line_count = lines.len();
+    let visible = layout[0].height as usize;
+    let max_scroll = lines.len().saturating_sub(visible);
+    if state.row_detail_scroll > max_scroll {
+        state.row_detail_scroll = max_scroll;
+    }
+
+    let body = Paragraph::new(lines).scroll((state.row_detail_scroll as u16, 0));
+    f.render_widget(body, layout[0]);
+
+    let footer = format!(
+        "  {} columns  ·  ↑↓ PgUp/PgDn scroll  ·  ⏎/Esc close",
+        state.result_headers.len()
+    );
+    f.render_widget(
+        Paragraph::new(footer).style(Style::default().fg(theme.border_inactive)),
+        layout[1],
+    );
 }
 
 /// Row-trace overlay: full lineage of the selected row — ancestors
@@ -965,23 +1061,7 @@ fn draw_main_details_grid(f: &mut Frame, area: Rect, state: &mut AppState, theme
     }
 
     let total_cols = state.result_headers.len();
-    let offset = state.col_scroll_offset.min(total_cols.saturating_sub(1));
-    let visible_headers = &state.result_headers[offset..];
-
-    let max_visible_cols = (grid_zone.width / 16).max(1) as usize;
-    let visible_count = visible_headers.len().min(max_visible_cols).max(1);
-    let sliced_headers = &visible_headers[0..visible_count.min(visible_headers.len())];
-
-    let widths = vec![Constraint::Percentage(100 / visible_count.max(1) as u16); visible_count];
-
-    let header_cells = sliced_headers.iter().map(|h| {
-        ratatui::widgets::Cell::from(format!(" {}", h))
-            .style(Style::default().fg(theme.header_fg).add_modifier(Modifier::BOLD))
-    });
-    let header = Row::new(header_cells)
-        .height(1)
-        .bottom_margin(1)
-        .style(Style::default().bg(HEADER_BG));
+    state.selected_col_idx = state.selected_col_idx.min(total_cols.saturating_sub(1));
 
     // Only build rows that pass the search filter; remember their original index
     // so selection/highlight stays correct relative to `result_rows`.
@@ -992,22 +1072,78 @@ fn draw_main_details_grid(f: &mut Frame, area: Rect, state: &mut AppState, theme
         draw_search_bar(f, sz, state, theme, match_count, state.result_rows.len());
     }
 
+    // lazysql-style layout: each column as wide as its widest visible value
+    // (clamped), packing as many columns as fit from the scroll offset.
+    let all_widths: Vec<u16> = (0..total_cols)
+        .map(|c| {
+            let mut w = state.result_headers[c].chars().count();
+            for &ri in &visible_indices {
+                if let Some(v) = state.result_rows[ri].get(c) {
+                    w = w.max(v.chars().count());
+                }
+            }
+            w.clamp(4, 28) as u16 + 1 // +1 for the leading-space padding
+        })
+        .collect();
+    let avail = grid_zone.width.saturating_sub(3); // borders + highlight symbol
+    let fit_from = |off: usize| -> usize {
+        let mut used: u16 = 0;
+        let mut n = 0;
+        for c in off..total_cols {
+            let w = all_widths[c] + 1; // + column spacing
+            if used + w > avail {
+                break;
+            }
+            used += w;
+            n += 1;
+        }
+        n.max(1)
+    };
+
+    // Keep the cell cursor inside the visible column window.
+    if state.selected_col_idx < state.col_scroll_offset {
+        state.col_scroll_offset = state.selected_col_idx;
+    }
+    while state.selected_col_idx >= state.col_scroll_offset + fit_from(state.col_scroll_offset) {
+        state.col_scroll_offset += 1;
+    }
+    let offset = state.col_scroll_offset.min(total_cols.saturating_sub(1));
+    let visible_count = fit_from(offset);
+
+    let widths: Vec<Constraint> = (offset..offset + visible_count)
+        .map(|c| Constraint::Length(all_widths[c]))
+        .collect();
+
+    let header_cells = (offset..offset + visible_count).map(|c| {
+        let style = if c == state.selected_col_idx {
+            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        } else {
+            Style::default().fg(theme.header_fg).add_modifier(Modifier::BOLD)
+        };
+        ratatui::widgets::Cell::from(format!(" {}", state.result_headers[c])).style(style)
+    });
+    let header = Row::new(header_cells)
+        .height(1)
+        .bottom_margin(1)
+        .style(Style::default().bg(HEADER_BG));
+
     let rows: Vec<Row> = visible_indices
         .iter()
         .enumerate()
         .map(|(vis_pos, &orig_idx)| {
             let row_cells = &state.result_rows[orig_idx];
-            let start = offset.min(row_cells.len());
-            let offset_cells = &row_cells[start..];
-            let take = visible_count.min(offset_cells.len());
             let is_selected = state.selected_row_idx == Some(orig_idx);
-            let cells = offset_cells[0..take].iter().map(|c| {
-                let cell_style = if c == "NULL" {
+            let cells = (offset..offset + visible_count).map(|c| {
+                let val = row_cells.get(c).map(|s| s.as_str()).unwrap_or("");
+                let cell_style = if is_selected && c == state.selected_col_idx {
+                    // The cell cursor.
+                    Style::default().fg(Color::Black).bg(theme.accent).add_modifier(Modifier::BOLD)
+                } else if val == "NULL" {
                     Style::default().fg(theme.border_inactive).add_modifier(Modifier::ITALIC)
                 } else {
                     Style::default().fg(theme.text_primary)
                 };
-                ratatui::widgets::Cell::from(format!(" {}", c)).style(cell_style)
+                ratatui::widgets::Cell::from(format!(" {}", val)).style(cell_style)
             });
             let row = Row::new(cells).height(1);
             if is_selected {
@@ -1026,7 +1162,12 @@ fn draw_main_details_grid(f: &mut Frame, area: Rect, state: &mut AppState, theme
         .and_then(|sel| visible_indices.iter().position(|&i| i == sel));
 
     let col_indicator = if total_cols > visible_count {
-        format!(" · col {}-{}/{} ◀▶", offset + 1, offset + visible_count, total_cols)
+        format!(
+            " · col {}/{} ({}) ◀▶",
+            state.selected_col_idx + 1,
+            total_cols,
+            state.result_headers.get(state.selected_col_idx).cloned().unwrap_or_default()
+        )
     } else {
         String::new()
     };
@@ -1041,7 +1182,7 @@ fn draw_main_details_grid(f: &mut Frame, area: Rect, state: &mut AppState, theme
     };
     let focused_grid = state.active_pane == ActivePane::QueryResults;
     let final_block = get_pane_block(
-        &format!("DATA VIEW{}{}{}", row_indicator, col_indicator, filter_indicator),
+        &format!("DATA VIEW{}{}{} · ⏎ record", row_indicator, col_indicator, filter_indicator),
         focused_grid,
         theme,
     );

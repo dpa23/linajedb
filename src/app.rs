@@ -356,6 +356,12 @@ pub struct AppState {
     pub describe_headers: Vec<String>, // describe table headers
     pub describe_rows: Vec<Vec<String>>, // describe table rows
 
+    // lazysql-style grid navigation
+    pub selected_col_idx: usize,     // cell cursor column (index into result_headers)
+    pub show_row_detail: bool,       // record view: selected row as column/value list
+    pub row_detail_scroll: usize,
+    pub row_detail_line_count: usize, // set by the UI each frame, used to clamp scroll
+
     // Row trace overlay (full lineage of the selected row)
     pub show_trace: bool,
     pub trace_loading: bool,
@@ -393,6 +399,7 @@ pub struct AppState {
     pub rect_query_bar: Option<Rect>,
     pub rect_describe: Option<Rect>,
     pub rect_trace: Option<Rect>,
+    pub rect_row_detail: Option<Rect>,
     // Clickable toolbar buttons: rebuilt every frame by the UI.
     pub toolbar_buttons: Vec<(Rect, ToolbarAction)>,
 }
@@ -495,6 +502,10 @@ impl AppState {
             show_describe: false,
             describe_headers: vec![],
             describe_rows: vec![],
+            selected_col_idx: 0,
+            show_row_detail: false,
+            row_detail_scroll: 0,
+            row_detail_line_count: 0,
             show_trace: false,
             trace_loading: false,
             trace_root: None,
@@ -524,6 +535,7 @@ impl AppState {
             rect_query_bar: None,
             rect_describe: None,
             rect_trace: None,
+            rect_row_detail: None,
             toolbar_buttons: vec![],
         };
 
@@ -903,6 +915,9 @@ impl AppState {
                 self.search_active = false;
                 self.search_query.clear();
                 self.col_scroll_offset = 0;
+                self.selected_col_idx = 0;
+                self.show_row_detail = false;
+                self.row_detail_scroll = 0;
                 self.rebuild_describe();
 
                 let cols_ref = self.result_headers.clone();
@@ -1932,6 +1947,18 @@ impl AppState {
         let is_inside = |rect: Rect| -> bool {
             col >= rect.x && col < rect.x + rect.width && row >= rect.y && row < rect.y + rect.height
         };
+
+        // 0. Row-detail overlay swallows clicks; clicking outside closes it.
+        if self.show_row_detail {
+            if let Some(rect) = self.rect_row_detail {
+                if !is_inside(rect) {
+                    self.show_row_detail = false;
+                }
+            } else {
+                self.show_row_detail = false;
+            }
+            return None;
+        }
 
         // 0. Trace overlay swallows clicks; clicking outside closes it.
         if self.show_trace {

@@ -200,7 +200,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     _ => {}
                 }
 
-                if state.connected && state.active_pane != ActivePane::SqlConsole && state.active_pane != ActivePane::ModalEditor && !state.show_delete_confirm && !state.search_active && !state.show_describe && !state.show_trace {
+                if state.connected && state.active_pane != ActivePane::SqlConsole && state.active_pane != ActivePane::ModalEditor && !state.show_delete_confirm && !state.search_active && !state.show_describe && !state.show_trace && !state.show_row_detail {
                     match key.code {
                         KeyCode::Char('1') => {
                             state.active_pane = ActivePane::Sidebar;
@@ -562,6 +562,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             continue;
                         }
 
+                        // Record-view overlay: Enter/Esc closes, arrows scroll.
+                        if state.show_row_detail {
+                            match key.code {
+                                KeyCode::Enter | KeyCode::Esc | KeyCode::Char(' ') => {
+                                    state.show_row_detail = false;
+                                }
+                                KeyCode::Up => {
+                                    state.row_detail_scroll = state.row_detail_scroll.saturating_sub(1);
+                                }
+                                KeyCode::Down => {
+                                    state.row_detail_scroll = (state.row_detail_scroll + 1)
+                                        .min(state.row_detail_line_count.saturating_sub(1));
+                                }
+                                KeyCode::PageUp => {
+                                    state.row_detail_scroll = state.row_detail_scroll.saturating_sub(10);
+                                }
+                                KeyCode::PageDown => {
+                                    state.row_detail_scroll = (state.row_detail_scroll + 10)
+                                        .min(state.row_detail_line_count.saturating_sub(1));
+                                }
+                                _ => {}
+                            }
+                            continue;
+                        }
+
                         // Row-trace overlay: t/Esc closes, j toggles JSON, arrows scroll.
                         if state.show_trace {
                             match key.code {
@@ -690,6 +715,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 // Toggle tree item expansion if document view
                                 if (state.active_engine == ActiveEngine::MongoDb || state.active_engine == ActiveEngine::LocalJson) && !is_dbf {
                                     state.toggle_selected_tree_item();
+                                } else if state.selected_row_idx.is_some() {
+                                    // Record view: the selected row as a column/value list.
+                                    state.show_row_detail = true;
+                                    state.row_detail_scroll = 0;
                                 }
                             }
                             KeyCode::Char('e') => {
@@ -725,15 +754,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
                             KeyCode::Left => {
-                                if state.col_scroll_offset > 0 {
-                                    state.col_scroll_offset -= 1;
-                                }
+                                state.selected_col_idx = state.selected_col_idx.saturating_sub(1);
                             }
                             KeyCode::Right => {
                                 let num_cols = state.result_headers.len();
-                                if num_cols > 0 && state.col_scroll_offset + 1 < num_cols {
-                                    state.col_scroll_offset += 1;
+                                if num_cols > 0 && state.selected_col_idx + 1 < num_cols {
+                                    state.selected_col_idx += 1;
                                 }
+                            }
+                            KeyCode::Home => {
+                                state.selected_col_idx = 0;
+                            }
+                            KeyCode::End => {
+                                state.selected_col_idx = state.result_headers.len().saturating_sub(1);
                             }
                             KeyCode::Esc => {
                                 state.active_pane = ActivePane::SqlConsole;
