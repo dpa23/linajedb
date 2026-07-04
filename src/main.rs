@@ -200,7 +200,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     _ => {}
                 }
 
-                if state.connected && state.active_pane != ActivePane::SqlConsole && state.active_pane != ActivePane::ModalEditor && !state.show_delete_confirm && !state.search_active && !state.show_describe {
+                if state.connected && state.active_pane != ActivePane::SqlConsole && state.active_pane != ActivePane::ModalEditor && !state.show_delete_confirm && !state.search_active && !state.show_describe && !state.show_trace {
                     match key.code {
                         KeyCode::Char('1') => {
                             state.active_pane = ActivePane::Sidebar;
@@ -562,6 +562,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             continue;
                         }
 
+                        // Row-trace overlay: t/Esc closes, j toggles JSON, arrows scroll.
+                        if state.show_trace {
+                            match key.code {
+                                KeyCode::Char('t') | KeyCode::Char('T') | KeyCode::Esc | KeyCode::Enter => {
+                                    state.close_row_trace();
+                                }
+                                KeyCode::Char('j') | KeyCode::Char('J') => {
+                                    state.trace_json_mode = !state.trace_json_mode;
+                                    state.trace_scroll = 0;
+                                }
+                                KeyCode::Up => {
+                                    state.trace_scroll = state.trace_scroll.saturating_sub(1);
+                                }
+                                KeyCode::Down => {
+                                    state.trace_scroll = (state.trace_scroll + 1)
+                                        .min(state.trace_line_count.saturating_sub(1));
+                                }
+                                KeyCode::PageUp => {
+                                    state.trace_scroll = state.trace_scroll.saturating_sub(10);
+                                }
+                                KeyCode::PageDown => {
+                                    state.trace_scroll = (state.trace_scroll + 10)
+                                        .min(state.trace_line_count.saturating_sub(1));
+                                }
+                                KeyCode::Home => {
+                                    state.trace_scroll = 0;
+                                }
+                                _ => {}
+                            }
+                            continue;
+                        }
+
                         // Describe/schema overlay: any of i/Esc/Enter closes it.
                         if state.show_describe {
                             match key.code {
@@ -612,6 +644,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                             KeyCode::Char('i') | KeyCode::Char('I') => {
                                 state.toggle_describe();
+                            }
+                            KeyCode::Char('t') | KeyCode::Char('T') => {
+                                if !is_document_view {
+                                    if let Some(req) = state.open_row_trace() {
+                                        let _ = app_tx.send(req).await;
+                                    }
+                                }
                             }
                             KeyCode::Char('r') | KeyCode::Char('R') => {
                                 if let Some(req) = state.trigger_toolbar_action(app::ToolbarAction::Refresh) {

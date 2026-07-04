@@ -7,6 +7,7 @@ pub mod config;
 
 use tokio::sync::mpsc;
 use serde_json::Value;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 #[derive(Debug, Clone)]
 pub enum DbEngineConfig {
@@ -33,8 +34,85 @@ pub enum DbRequest {
     ExecuteQuery(String),
     LoadMetadata { table: String },
     LoadRelatedData { relationship: RelationshipInfo, active_row_val: String },
+    TraceRow { table: String, columns: Vec<String>, values: Vec<String> },
     LoadDatabases,
     SelectDatabase(String),
+}
+
+/// Direction of a node in a row-trace tree relative to its parent node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TraceKind {
+    Root,
+    Parent,
+    Child,
+}
+
+/// One row in the lineage tree of a traced row. `children` holds the next
+/// hop in the same direction: ancestors of a Parent node, descendants of a
+/// Child node; the Root node carries both (Parents first, then Children).
+#[derive(Debug, Clone)]
+pub struct TraceNode {
+    pub kind: TraceKind,
+    pub table: String,
+    /// FK that led here, e.g. "orders.customer_id = customers.id". Empty for the root.
+    pub via: String,
+    pub columns: Vec<String>,
+    pub values: Vec<String>,
+    pub children: Vec<TraceNode>,
+    /// Why the walk stopped here (cycle, depth cap, extra rows, error).
+    pub note: Option<String>,
+}
+
+impl TraceNode {
+    pub fn node_count(&self) -> usize {
+        1 + self.children.iter().map(|c| c.node_count()).sum::<usize>()
+    }
+
+    pub fn to_json(&self) -> Value {
+        let mut row = serde_json::Map::new();
+        for (col, val) in self.columns.iter().zip(self.values.iter()) {
+            row.insert(col.clone(), cell_to_json(val));
+        }
+        let mut obj = serde_json::Map::new();
+        obj.insert("table".to_string(), Value::String(self.table.clone()));
+        if !self.via.is_empty() {
+            obj.insert("via".to_string(), Value::String(self.via.clone()));
+        }
+        if let Some(ref note) = self.note {
+            obj.insert("note".to_string(), Value::String(note.clone()));
+        }
+        obj.insert("row".to_string(), Value::Object(row));
+        let parents: Vec<Value> = self.children.iter()
+            .filter(|c| c.kind == TraceKind::Parent)
+            .map(|c| c.to_json())
+            .collect();
+        let children: Vec<Value> = self.children.iter()
+            .filter(|c| c.kind == TraceKind::Child)
+            .map(|c| c.to_json())
+            .collect();
+        if !parents.is_empty() {
+            obj.insert("parents".to_string(), Value::Array(parents));
+        }
+        if !children.is_empty() {
+            obj.insert("children".to_string(), Value::Array(children));
+        }
+        Value::Object(obj)
+    }
+}
+
+fn cell_to_json(val: &str) -> Value {
+    if val == "NULL" {
+        return Value::Null;
+    }
+    if let Ok(n) = val.parse::<i64>() {
+        return Value::Number(n.into());
+    }
+    if let Ok(f) = val.parse::<f64>() {
+        if let Some(n) = serde_json::Number::from_f64(f) {
+            return Value::Number(n);
+        }
+    }
+    Value::String(val.to_string())
 }
 
 #[derive(Debug, Clone)]
@@ -54,6 +132,7 @@ pub enum DbResponse {
         columns: Vec<String>,
         rows: Vec<Vec<String>>,
     },
+    RowTrace(TraceNode),
     Databases(Vec<String>),
     DatabaseSelected,
     Error(String),
@@ -101,6 +180,7 @@ impl DbWorker {
                 DbRequest::ExecuteQuery(query) => self.handle_execute_query(&query).await,
                 DbRequest::LoadMetadata { table } => self.handle_load_metadata(&table).await,
                 DbRequest::LoadRelatedData { relationship, active_row_val } => self.handle_load_related_data(relationship, active_row_val).await,
+                DbRequest::TraceRow { table, columns, values } => self.handle_trace_row(table, columns, values).await,
                 DbRequest::LoadDatabases => self.handle_load_databases().await,
                 DbRequest::SelectDatabase(db_name) => self.handle_select_database(db_name).await,
             };
@@ -350,6 +430,184 @@ impl DbWorker {
         }
     }
 
+    async fn trace_select(&self, query: &str) -> Result<(Vec<String>, Vec<Vec<String>>), String> {
+        match &self.connection {
+            ActiveConnection::MariaDb(pool) => mysql::execute_mysql_query(pool, query).await.map_err(|e| e.to_string()),
+            ActiveConnection::PostgreSql(pool) => postgres::execute_postgres_query(pool, query).await.map_err(|e| e.to_string()),
+            ActiveConnection::Sqlite(pool) => sqlite::execute_sqlite_query(pool, query).await.map_err(|e| e.to_string()),
+            _ => Err("Row trace is only supported for relational databases".to_string()),
+        }
+    }
+
+    async fn trace_relationships(&self, table: &str) -> Result<Vec<RelationshipInfo>, String> {
+        match &self.connection {
+            ActiveConnection::MariaDb(pool) => mysql::fetch_mysql_metadata(pool, table).await.map(|(_, r)| r).map_err(|e| e.to_string()),
+            ActiveConnection::PostgreSql(pool) => postgres::fetch_postgres_metadata(pool, table).await.map(|(_, r)| r).map_err(|e| e.to_string()),
+            ActiveConnection::Sqlite(pool) => sqlite::fetch_sqlite_metadata(pool, table).await.map(|(_, r)| r).map_err(|e| e.to_string()),
+            _ => Err("Row trace is only supported for relational databases".to_string()),
+        }
+    }
+
+    /// Walk the FK graph in both directions from one row: ancestors
+    /// (parents of parents, one row per FK) and descendants (children of
+    /// children, a few rows per FK). Bounded by depth, rows-per-relation
+    /// and a global node budget; cycles are cut with a visited set.
+    async fn handle_trace_row(
+        &self,
+        table: String,
+        columns: Vec<String>,
+        values: Vec<String>,
+    ) -> DbResponse {
+        const MAX_UP: usize = 4;       // ancestor depth
+        const MAX_DOWN: usize = 3;     // descendant depth
+        const ROWS_PER_REL: usize = 5; // child rows fetched per relation
+        const NODE_BUDGET: usize = 200;
+
+        if let ActiveConnection::None = self.connection {
+            return DbResponse::Error("Not connected".to_string());
+        }
+
+        // Arena of nodes + child indices, so the walk stays iterative
+        // (async recursion would need boxing) and budget checks are global.
+        let mut nodes: Vec<TraceNode> = vec![TraceNode {
+            kind: TraceKind::Root,
+            table: table.clone(),
+            via: String::new(),
+            columns,
+            values,
+            children: Vec::new(),
+            note: None,
+        }];
+        let mut kids: Vec<Vec<usize>> = vec![Vec::new()];
+        let mut rel_cache: HashMap<String, Vec<RelationshipInfo>> = HashMap::new();
+        // (table, col, value) triples already expanded upward, to cut FK cycles.
+        let mut visited_up: HashSet<(String, String, String)> = HashSet::new();
+
+        // Phase 1: ancestors. Phase 2: descendants (root re-queued).
+        let mut queue: VecDeque<(usize, usize, bool)> = VecDeque::new();
+        queue.push_back((0, 0, true));
+        queue.push_back((0, 0, false));
+        let mut budget_hit = false;
+
+        while let Some((idx, depth, upward)) = queue.pop_front() {
+            let max_depth = if upward { MAX_UP } else { MAX_DOWN };
+            if depth >= max_depth {
+                nodes[idx].note.get_or_insert_with(|| "depth limit".to_string());
+                continue;
+            }
+            if nodes.len() >= NODE_BUDGET {
+                budget_hit = true;
+                continue;
+            }
+
+            let node_table = nodes[idx].table.clone();
+            let rels = match rel_cache.get(&node_table) {
+                Some(r) => r.clone(),
+                None => match self.trace_relationships(&node_table).await {
+                    Ok(r) => {
+                        rel_cache.insert(node_table.clone(), r.clone());
+                        r
+                    }
+                    Err(e) => {
+                        nodes[idx].note = Some(format!("metadata error: {}", e));
+                        continue;
+                    }
+                },
+            };
+
+            for rel in rels.iter().filter(|r| r.is_parent == upward) {
+                let col_pos = nodes[idx]
+                    .columns
+                    .iter()
+                    .position(|c| c.eq_ignore_ascii_case(&rel.active_col));
+                let val = match col_pos.and_then(|p| nodes[idx].values.get(p)) {
+                    Some(v) if v != "NULL" && !v.is_empty() => v.clone(),
+                    _ => continue, // FK is null/absent: nothing to follow
+                };
+                let kind = if upward { TraceKind::Parent } else { TraceKind::Child };
+                let via = if upward {
+                    format!("{}.{} = {}.{}", node_table, rel.active_col, rel.target_table, rel.target_col)
+                } else {
+                    format!("{}.{} = {}.{}", rel.target_table, rel.target_col, node_table, rel.active_col)
+                };
+
+                if upward {
+                    let key = (rel.target_table.clone(), rel.target_col.clone(), val.clone());
+                    if !visited_up.insert(key) {
+                        nodes.push(TraceNode {
+                            kind, table: rel.target_table.clone(), via,
+                            columns: vec![], values: vec![],
+                            children: vec![], note: Some("cycle: already traced".to_string()),
+                        });
+                        kids.push(Vec::new());
+                        let new_idx = nodes.len() - 1;
+                        kids[idx].push(new_idx);
+                        continue;
+                    }
+                }
+
+                let limit = if upward { 1 } else { ROWS_PER_REL + 1 };
+                let query = format!(
+                    "SELECT * FROM {} WHERE {} = '{}' LIMIT {};",
+                    rel.target_table, rel.target_col, val.replace('\'', "''"), limit,
+                );
+                let (r_cols, r_rows) = match self.trace_select(&query).await {
+                    Ok(res) => res,
+                    Err(e) => {
+                        nodes.push(TraceNode {
+                            kind, table: rel.target_table.clone(), via,
+                            columns: vec![], values: vec![],
+                            children: vec![], note: Some(format!("query error: {}", e)),
+                        });
+                        kids.push(Vec::new());
+                        let new_idx = nodes.len() - 1;
+                        kids[idx].push(new_idx);
+                        continue;
+                    }
+                };
+
+                // The engines report an empty result as a "Status" pseudo-row;
+                // for a trace that simply means "no related rows here".
+                let mut r_rows = r_rows;
+                if r_cols.len() == 1 && r_cols[0] == "Status" {
+                    r_rows.clear();
+                }
+                let overflow = !upward && r_rows.len() > ROWS_PER_REL;
+                if overflow {
+                    r_rows.truncate(ROWS_PER_REL);
+                }
+                let row_count = r_rows.len();
+                for (i, row) in r_rows.into_iter().enumerate() {
+                    if nodes.len() >= NODE_BUDGET {
+                        budget_hit = true;
+                        break;
+                    }
+                    let note = if overflow && i == row_count - 1 {
+                        Some("more rows exist (limit reached)".to_string())
+                    } else {
+                        None
+                    };
+                    nodes.push(TraceNode {
+                        kind, table: rel.target_table.clone(), via: via.clone(),
+                        columns: r_cols.clone(), values: row,
+                        children: vec![], note,
+                    });
+                    kids.push(Vec::new());
+                    let new_idx = nodes.len() - 1;
+                    kids[idx].push(new_idx);
+                    queue.push_back((new_idx, depth + 1, upward));
+                }
+            }
+        }
+
+        if budget_hit {
+            nodes[0].note.get_or_insert_with(|| {
+                format!("trace truncated at {} nodes", NODE_BUDGET)
+            });
+        }
+        DbResponse::RowTrace(assemble_trace(0, &mut nodes, &kids))
+    }
+
     async fn handle_load_databases(&self) -> DbResponse {
         match &self.connection {
             ActiveConnection::None => DbResponse::Error("Not connected".to_string()),
@@ -408,6 +666,25 @@ impl DbWorker {
             other => other,
         }
     }
+}
+
+/// Rebuild the nested TraceNode tree from the flat arena produced by the walk.
+fn assemble_trace(idx: usize, nodes: &mut [TraceNode], kids: &[Vec<usize>]) -> TraceNode {
+    let placeholder = TraceNode {
+        kind: TraceKind::Root,
+        table: String::new(),
+        via: String::new(),
+        columns: vec![],
+        values: vec![],
+        children: vec![],
+        note: None,
+    };
+    let mut node = std::mem::replace(&mut nodes[idx], placeholder);
+    node.children = kids[idx]
+        .iter()
+        .map(|&c| assemble_trace(c, nodes, kids))
+        .collect();
+    node
 }
 
 fn replace_db_in_url(url: &str, new_db: &str) -> String {

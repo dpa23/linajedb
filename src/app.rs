@@ -124,6 +124,7 @@ pub enum ActivePane {
 pub enum ToolbarAction {
     Search,
     Describe,
+    Trace,
     Edit,
     Add,
     Delete,
@@ -141,6 +142,7 @@ impl ToolbarAction {
         match self {
             ToolbarAction::Search => "⌕ Search",
             ToolbarAction::Describe => "≡ Describe",
+            ToolbarAction::Trace => "⛓ Trace",
             ToolbarAction::Edit => "✎ Edit",
             ToolbarAction::Add => "+ Add",
             ToolbarAction::Delete => "✗ Delete",
@@ -157,6 +159,7 @@ impl ToolbarAction {
         match self {
             ToolbarAction::Search => "/",
             ToolbarAction::Describe => "i",
+            ToolbarAction::Trace => "t",
             ToolbarAction::Edit => "e",
             ToolbarAction::Add => "a",
             ToolbarAction::Delete => "d",
@@ -353,6 +356,15 @@ pub struct AppState {
     pub describe_headers: Vec<String>, // describe table headers
     pub describe_rows: Vec<Vec<String>>, // describe table rows
 
+    // Row trace overlay (full lineage of the selected row)
+    pub show_trace: bool,
+    pub trace_loading: bool,
+    pub trace_root: Option<crate::db::TraceNode>,
+    pub trace_error: Option<String>,
+    pub trace_json_mode: bool, // false = tree view, true = raw JSON view
+    pub trace_scroll: usize,
+    pub trace_line_count: usize, // set by the UI each frame, used to clamp scroll
+
     // Interactive Modal Row Editors
     pub show_edit_modal: bool,
     pub show_add_modal: bool,
@@ -380,6 +392,7 @@ pub struct AppState {
     pub rect_related_grid: Option<Rect>,
     pub rect_query_bar: Option<Rect>,
     pub rect_describe: Option<Rect>,
+    pub rect_trace: Option<Rect>,
     // Clickable toolbar buttons: rebuilt every frame by the UI.
     pub toolbar_buttons: Vec<(Rect, ToolbarAction)>,
 }
@@ -482,6 +495,13 @@ impl AppState {
             show_describe: false,
             describe_headers: vec![],
             describe_rows: vec![],
+            show_trace: false,
+            trace_loading: false,
+            trace_root: None,
+            trace_error: None,
+            trace_json_mode: false,
+            trace_scroll: 0,
+            trace_line_count: 0,
             show_edit_modal: false,
             show_add_modal: false,
             show_delete_confirm: false,
@@ -503,6 +523,7 @@ impl AppState {
             rect_related_grid: None,
             rect_query_bar: None,
             rect_describe: None,
+            rect_trace: None,
             toolbar_buttons: vec![],
         };
 
@@ -910,6 +931,12 @@ impl AppState {
                 self.related_selected_row_idx = if !self.related_rows.is_empty() { Some(0) } else { None };
                 self.related_col_scroll_offset = 0;
             }
+            DbResponse::RowTrace(root) => {
+                self.trace_loading = false;
+                self.trace_error = None;
+                self.trace_root = Some(root);
+                self.trace_scroll = 0;
+            }
             DbResponse::DocumentResult(docs) => {
                 self.tree_roots.clear();
                 for (i, doc) in docs.iter().enumerate() {
@@ -924,10 +951,16 @@ impl AppState {
                 self.search_query.clear();
             }
             DbResponse::Error(err) => {
-                self.conn_status_msg = format!("Error: {}", err);
-                self.result_headers = vec!["Error".to_string()];
-                self.result_rows = vec![vec![err]];
-                self.selected_row_idx = Some(0);
+                if self.show_trace && self.trace_loading {
+                    // Keep the results grid intact: show the error inside the overlay.
+                    self.trace_loading = false;
+                    self.trace_error = Some(err);
+                } else {
+                    self.conn_status_msg = format!("Error: {}", err);
+                    self.result_headers = vec!["Error".to_string()];
+                    self.result_rows = vec![vec![err]];
+                    self.selected_row_idx = Some(0);
+                }
             }
         }
     }
@@ -1761,6 +1794,38 @@ impl AppState {
         self.show_describe = !self.show_describe;
     }
 
+    /// Open the row-trace overlay for the selected result row and build the
+    /// worker request that walks its full FK lineage (ancestors + descendants).
+    pub fn open_row_trace(&mut self) -> Option<DbRequest> {
+        if self.show_trace {
+            self.close_row_trace();
+            return None;
+        }
+        let table = self.active_table_name.clone()?;
+        let idx = self.selected_row_idx?;
+        let row = self.result_rows.get(idx)?.clone();
+        self.show_describe = false;
+        self.show_trace = true;
+        self.trace_loading = true;
+        self.trace_root = None;
+        self.trace_error = None;
+        self.trace_json_mode = false;
+        self.trace_scroll = 0;
+        Some(DbRequest::TraceRow {
+            table,
+            columns: self.result_headers.clone(),
+            values: row,
+        })
+    }
+
+    pub fn close_row_trace(&mut self) {
+        self.show_trace = false;
+        self.trace_loading = false;
+        self.trace_root = None;
+        self.trace_error = None;
+        self.trace_scroll = 0;
+    }
+
     /// Run a toolbar action (shared by mouse clicks and keyboard shortcuts).
     /// Returns a DbRequest when the action needs the worker (e.g. refresh/back).
     pub fn trigger_toolbar_action(&mut self, action: ToolbarAction) -> Option<DbRequest> {
@@ -1779,6 +1844,10 @@ impl AppState {
                 self.active_pane = ActivePane::QueryResults;
                 self.toggle_describe();
                 None
+            }
+            ToolbarAction::Trace => {
+                self.active_pane = ActivePane::QueryResults;
+                self.open_row_trace()
             }
             ToolbarAction::Edit => {
                 self.active_pane = ActivePane::QueryResults;
@@ -1863,6 +1932,18 @@ impl AppState {
         let is_inside = |rect: Rect| -> bool {
             col >= rect.x && col < rect.x + rect.width && row >= rect.y && row < rect.y + rect.height
         };
+
+        // 0. Trace overlay swallows clicks; clicking outside closes it.
+        if self.show_trace {
+            if let Some(rect) = self.rect_trace {
+                if !is_inside(rect) {
+                    self.close_row_trace();
+                }
+            } else {
+                self.close_row_trace();
+            }
+            return None;
+        }
 
         // 0. Describe overlay swallows clicks; clicking outside closes it.
         if self.show_describe {

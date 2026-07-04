@@ -123,9 +123,201 @@ pub fn draw_ui(f: &mut Frame, state: &mut AppState) {
         draw_row_editor_modal(f, size, state, &theme);
     } else if state.show_delete_confirm {
         draw_delete_confirm_modal(f, size, state, &theme);
+    } else if state.show_trace {
+        draw_trace_modal(f, size, state, &theme);
     } else if state.show_describe {
         draw_describe_modal(f, size, state, &theme);
     }
+}
+
+/// Row-trace overlay: full lineage of the selected row — ancestors
+/// (parents of parents) and descendants (children of children) — as a
+/// colored tree or as raw JSON ([j] toggles).
+fn draw_trace_modal(f: &mut Frame, container_area: Rect, state: &mut AppState, theme: &Theme) {
+    let modal_area = get_centered_rect(84, 82, container_area);
+    f.render_widget(Clear, modal_area);
+    state.rect_trace = Some(modal_area);
+
+    let table_label = state.active_table_name.clone().unwrap_or_else(|| "row".to_string());
+    let mode = if state.trace_json_mode { "JSON" } else { "TREE" };
+    let title = format!(" TRACE: {}  ·  view: {} ", table_label, mode);
+    let block = get_pane_block(&title, true, theme).bg(Color::Black);
+    f.render_widget(block.clone(), modal_area);
+    let inner = block.inner(modal_area);
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(1)])
+        .split(inner);
+
+    let (lines, footer_info): (Vec<Line>, String) = if state.trace_loading {
+        (
+            vec![Line::from(Span::styled(
+                "  Tracing row lineage (ancestors + descendants)...",
+                Style::default().fg(theme.accent),
+            ))],
+            "loading".to_string(),
+        )
+    } else if let Some(ref err) = state.trace_error {
+        (
+            vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    format!("  Trace failed: {}", err),
+                    Style::default().fg(theme.danger),
+                )),
+            ],
+            "error".to_string(),
+        )
+    } else if let Some(root) = state.trace_root.clone() {
+        if state.trace_json_mode {
+            let json = serde_json::to_string_pretty(&root.to_json())
+                .unwrap_or_else(|e| format!("JSON error: {}", e));
+            let lines = json
+                .lines()
+                .map(|l| render_trace_json_line(l, theme))
+                .collect();
+            (lines, format!("{} nodes", root.node_count()))
+        } else {
+            let mut lines = Vec::new();
+            render_trace_node(&root, "", true, true, &mut lines, theme);
+            (lines, format!("{} nodes", root.node_count()))
+        }
+    } else {
+        (
+            vec![Line::from(Span::styled(
+                "  No trace loaded. Select a row and press [t].",
+                Style::default().fg(theme.text_secondary),
+            ))],
+            "empty".to_string(),
+        )
+    };
+
+    // Clamp scroll now that the real line count is known.
+    state.trace_line_count = lines.len();
+    let visible = layout[0].height as usize;
+    let max_scroll = lines.len().saturating_sub(visible);
+    if state.trace_scroll > max_scroll {
+        state.trace_scroll = max_scroll;
+    }
+
+    let body = Paragraph::new(lines).scroll((state.trace_scroll as u16, 0));
+    f.render_widget(body, layout[0]);
+
+    let footer = format!(
+        "  ▲ parents · ▼ children · {}  |  [j] tree/json  ·  ↑↓ PgUp/PgDn scroll  ·  [t]/Esc close",
+        footer_info
+    );
+    f.render_widget(
+        Paragraph::new(footer).style(Style::default().fg(theme.border_inactive)),
+        layout[1],
+    );
+}
+
+/// One line per node: branch guides + direction glyph + table + row summary,
+/// with the FK that led there rendered dimmed underneath-in-line.
+fn render_trace_node(
+    node: &crate::db::TraceNode,
+    prefix: &str,
+    is_last: bool,
+    is_root: bool,
+    lines: &mut Vec<Line<'static>>,
+    theme: &Theme,
+) {
+    use crate::db::TraceKind;
+
+    let (glyph, color) = match node.kind {
+        TraceKind::Root => ("●", theme.header_fg),
+        TraceKind::Parent => ("▲", theme.accent),
+        TraceKind::Child => ("▼", theme.success),
+    };
+
+    // Row summary: first few columns as col=val, values truncated.
+    let mut summary = String::new();
+    for (col, val) in node.columns.iter().zip(node.values.iter()).take(5) {
+        if !summary.is_empty() {
+            summary.push_str(", ");
+        }
+        let mut v = val.clone();
+        if v.chars().count() > 18 {
+            v = format!("{}…", v.chars().take(17).collect::<String>());
+        }
+        summary.push_str(&format!("{}={}", col, v));
+    }
+    if node.columns.len() > 5 {
+        summary.push_str(", …");
+    }
+
+    let branch = if is_root {
+        " ".to_string()
+    } else if is_last {
+        format!(" {}└─", prefix)
+    } else {
+        format!(" {}├─", prefix)
+    };
+
+    let mut spans: Vec<Span> = vec![
+        Span::styled(branch.clone(), Style::default().fg(theme.border_inactive)),
+        Span::styled(
+            format!("{} {} ", glyph, node.table),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if !node.via.is_empty() {
+        spans.push(Span::styled(
+            format!("({}) ", node.via),
+            Style::default().fg(theme.border_inactive),
+        ));
+    }
+    spans.push(Span::styled(summary, Style::default().fg(theme.text_secondary)));
+    if let Some(ref note) = node.note {
+        let note_color = if note.contains("error") || note.contains("cycle") {
+            theme.danger
+        } else {
+            theme.border_inactive
+        };
+        spans.push(Span::styled(
+            format!("  [{}]", note),
+            Style::default().fg(note_color).add_modifier(Modifier::ITALIC),
+        ));
+    }
+    lines.push(Line::from(spans));
+
+    let child_prefix = if is_root {
+        " ".to_string()
+    } else if is_last {
+        format!("{}   ", prefix)
+    } else {
+        format!("{}│  ", prefix)
+    };
+    let count = node.children.len();
+    for (i, child) in node.children.iter().enumerate() {
+        render_trace_node(child, &child_prefix, i == count - 1, false, lines, theme);
+    }
+}
+
+/// Light syntax coloring for the JSON view: keys accented, structure dimmed.
+fn render_trace_json_line(raw: &str, theme: &Theme) -> Line<'static> {
+    let indent_len = raw.len() - raw.trim_start().len();
+    let (indent, rest) = raw.split_at(indent_len);
+    let mut spans: Vec<Span> = vec![Span::raw(format!(" {}", indent))];
+    if let Some(colon) = rest.find("\": ") {
+        let (key, value) = rest.split_at(colon + 2);
+        spans.push(Span::styled(
+            key.to_string(),
+            Style::default().fg(theme.accent),
+        ));
+        spans.push(Span::styled(
+            value.to_string(),
+            Style::default().fg(theme.text_primary),
+        ));
+    } else {
+        spans.push(Span::styled(
+            rest.to_string(),
+            Style::default().fg(theme.text_secondary),
+        ));
+    }
+    Line::from(spans)
 }
 
 fn draw_describe_modal(f: &mut Frame, container_area: Rect, state: &mut AppState, theme: &Theme) {
@@ -488,6 +680,7 @@ fn draw_action_toolbar(f: &mut Frame, area: Rect, state: &mut AppState, theme: &
 
     let mut actions: Vec<ToolbarAction> = vec![ToolbarAction::Search, ToolbarAction::Describe];
     if is_relational {
+        actions.push(ToolbarAction::Trace);
         actions.push(ToolbarAction::Edit);
         actions.push(ToolbarAction::Add);
         actions.push(ToolbarAction::Delete);
