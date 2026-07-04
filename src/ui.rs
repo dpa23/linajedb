@@ -501,11 +501,11 @@ fn draw_connection_screen(f: &mut Frame, area: Rect, state: &mut AppState, theme
     let outer_block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.border_inactive))
-        .title(" db-tui - Dynamic Access Database Client ")
+        .title(" linaje.db — Row-Lineage Database Client ")
         .title_style(Style::default().fg(theme.header_fg).add_modifier(Modifier::BOLD));
     
     let welcome_msg = Paragraph::new(
-        "\n  Welcome to db-tui - Local Multi-Engine Terminal Client\n\n  Press [F2] for Profiles, [F3] for Manual Form, [F4] for Raw Connection URL.\n  Use Left/Right to change engines, Up/Down to navigate fields, and Enter to connect.\n"
+        "\n  Welcome to linaje.db — Multi-Engine Terminal Client with Row Lineage\n\n  Press [F2] for Profiles, [F3] for Manual Form, [F4] for Raw Connection URL.\n  Use Left/Right to change engines, Up/Down to navigate fields, and Enter to connect.\n"
     ).block(outer_block).style(Style::default().fg(theme.text_secondary));
     f.render_widget(welcome_msg, area);
 
@@ -738,7 +738,7 @@ fn draw_header_tabs(f: &mut Frame, area: Rect, state: &mut AppState, theme: &The
     let block = Block::default()
         .borders(Borders::BOTTOM)
         .border_style(Style::default().fg(border_color))
-        .title(format!(" db-tui - {} Client ", state.active_engine.name()))
+        .title(format!(" linaje.db - {} Client ", state.active_engine.name()))
         .title_style(Style::default().fg(theme.header_fg).add_modifier(Modifier::BOLD));
 
     let active_idx = match state.active_pane {

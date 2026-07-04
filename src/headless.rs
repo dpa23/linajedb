@@ -1,13 +1,13 @@
 //! Headless (non-interactive) subcommands, for scripts and AI agents.
 //!
-//! `db-tui trace` reuses the same DbWorker the TUI uses, but prints the
+//! `linajedb trace` reuses the same DbWorker the TUI uses, but prints the
 //! row-lineage tree to stdout (JSON by default) instead of drawing panes.
 
 use crate::db::{DbEngineConfig, DbRequest, DbResponse, DbWorker, TraceKind, TraceNode};
 use tokio::sync::mpsc;
 
 const USAGE: &str = "\
-Usage: db-tui trace --url <URL> --table <TABLE> --where <CONDITION> [--format json|tree]
+Usage: linajedb trace --url <URL> --table <TABLE> --where <CONDITION> [--format json|tree]
 
 Walks the relationship graph from one row/document/node in both directions
 (ancestors of ancestors, children of children) and prints the lineage.
@@ -31,7 +31,7 @@ by naming convention (user_id / id_user / userId -> collection user(s));
 Neo4j follows real edges (outgoing = parents, incoming = children).
 
 Example:
-  db-tui trace --url mysql://root:pw@127.0.0.1:3306/shop \\
+  linajedb trace --url mysql://root:pw@127.0.0.1:3306/shop \\
       --table orders --where \"id_order=118\" --format tree";
 
 struct TraceArgs {
