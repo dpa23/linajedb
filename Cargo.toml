@@ -18,3 +18,5 @@ dbase = "0.5"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["serde", "v4"] }
 futures = "0.3"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"

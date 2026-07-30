@@ -1,4 +1,4 @@
-use crate::app::{ActiveEngine, ActivePane, AppState, BiChartType, ToolbarAction};
+use crate::tui::state::{ActiveEngine, ActivePane, AppState, BiChartType, ToolbarAction};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
@@ -7,13 +7,7 @@ use ratatui::{
     Frame,
 };
 
-#[derive(Debug, Clone)]
-pub struct BiBarData {
-    pub label: String,
-    pub value: u64,
-}
-
-// Charcoal / Slate Modern Palette
+/// Lazy* palette — yellow/orange accents, muted borders (lazygit / lazydocker grammar).
 pub struct Theme {
     pub border_active: Color,
     pub border_inactive: Color,
@@ -23,35 +17,43 @@ pub struct Theme {
     pub accent: Color,
     pub danger: Color,
     pub success: Color,
+    #[allow(dead_code)]
+    pub selection_bg: Color,
 }
 
 impl Default for Theme {
     fn default() -> Self {
         Self {
-            border_active: Color::Rgb(137, 180, 250),   // Pastel Blue
-            border_inactive: Color::Rgb(88, 91, 112),   // Dark Grey
-            text_primary: Color::Rgb(220, 224, 232),    // Off-white
-            text_secondary: Color::Rgb(166, 173, 200),  // Muted gray
-            header_fg: Color::Rgb(249, 226, 175),       // Soft gold
-            accent: Color::Rgb(137, 220, 235),          // Teal
-            danger: Color::Rgb(243, 139, 168),          // Red
-            success: Color::Rgb(166, 227, 161),         // Green
+            border_active: Color::Rgb(250, 179, 50),    // Lazy orange/yellow
+            border_inactive: Color::Rgb(80, 80, 80),    // Dim grey
+            text_primary: Color::Rgb(200, 200, 200),    // Soft white
+            text_secondary: Color::Rgb(130, 130, 130),  // Muted
+            header_fg: Color::Rgb(250, 200, 80),        // Gold
+            accent: Color::Rgb(87, 174, 255),           // Soft blue key hints
+            danger: Color::Rgb(255, 100, 100),          // Soft red
+            success: Color::Rgb(80, 200, 120),          // Soft green
+            selection_bg: Color::Rgb(40, 44, 52),       // Slate selection
         }
     }
 }
 
 pub fn get_pane_block(title: &str, is_focused: bool, theme: &Theme) -> Block<'static> {
+    let title_clean = title.trim();
     if is_focused {
         Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(theme.border_active))
-            .title(format!(" [{}] ", title))
-            .title_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+            .title(format!(" {} ", title_clean))
+            .title_style(
+                Style::default()
+                    .fg(theme.header_fg)
+                    .add_modifier(Modifier::BOLD),
+            )
     } else {
         Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(theme.border_inactive))
-            .title(format!(" {} ", title))
+            .title(format!(" {} ", title_clean))
             .title_style(Style::default().fg(theme.text_secondary))
     }
 }
@@ -226,18 +228,19 @@ fn draw_row_detail_modal(f: &mut Frame, container_area: Rect, state: &mut AppSta
     );
 }
 
-/// Row-trace overlay: full lineage of the selected row — ancestors
-/// (parents of parents) and descendants (children of children) — as a
-/// colored tree or as raw JSON ([j] toggles).
+/// Dual-pane lineage overlay: Ascendencia (▲) | Descendencia (▼), or JSON.
 fn draw_trace_modal(f: &mut Frame, container_area: Rect, state: &mut AppState, theme: &Theme) {
-    let modal_area = get_centered_rect(84, 82, container_area);
+    let modal_area = get_centered_rect(90, 86, container_area);
     f.render_widget(Clear, modal_area);
     state.rect_trace = Some(modal_area);
 
-    let table_label = state.active_table_name.clone().unwrap_or_else(|| "row".to_string());
+    let table_label = state
+        .active_table_name
+        .clone()
+        .unwrap_or_else(|| "row".to_string());
     let mode = if state.trace_json_mode { "JSON" } else { "TREE" };
-    let title = format!(" TRACE: {}  ·  view: {} ", table_label, mode);
-    let block = get_pane_block(&title, true, theme).bg(Color::Black);
+    let title = format!(" Lineage · {} · {} ", table_label, mode);
+    let block = get_pane_block(&title, true, theme);
     f.render_widget(block.clone(), modal_area);
     let inner = block.inner(modal_area);
 
@@ -246,72 +249,149 @@ fn draw_trace_modal(f: &mut Frame, container_area: Rect, state: &mut AppState, t
         .constraints([Constraint::Min(3), Constraint::Length(1)])
         .split(inner);
 
-    let (lines, footer_info): (Vec<Line>, String) = if state.trace_loading {
-        (
-            vec![Line::from(Span::styled(
-                "  Tracing row lineage (ancestors + descendants)...",
-                Style::default().fg(theme.accent),
-            ))],
-            "loading".to_string(),
-        )
-    } else if let Some(ref err) = state.trace_error {
-        (
-            vec![
-                Line::from(""),
-                Line::from(Span::styled(
-                    format!("  Trace failed: {}", err),
-                    Style::default().fg(theme.danger),
-                )),
-            ],
-            "error".to_string(),
-        )
-    } else if let Some(root) = state.trace_root.clone() {
-        if state.trace_json_mode {
-            let json = serde_json::to_string_pretty(&root.to_json())
-                .unwrap_or_else(|e| format!("JSON error: {}", e));
-            let lines = json
-                .lines()
-                .map(|l| render_trace_json_line(l, theme))
-                .collect();
-            (lines, format!("{} nodes", root.node_count()))
-        } else {
-            let mut lines = Vec::new();
-            render_trace_node(&root, "", true, true, &mut lines, theme);
-            (lines, format!("{} nodes", root.node_count()))
-        }
-    } else {
-        (
-            vec![Line::from(Span::styled(
-                "  No trace loaded. Select a row and press [t].",
-                Style::default().fg(theme.text_secondary),
-            ))],
-            "empty".to_string(),
-        )
-    };
-
-    // Clamp scroll now that the real line count is known.
-    state.trace_line_count = lines.len();
-    let visible = layout[0].height as usize;
-    let max_scroll = lines.len().saturating_sub(visible);
-    if state.trace_scroll > max_scroll {
-        state.trace_scroll = max_scroll;
+    if state.trace_loading {
+        let body = Paragraph::new(Span::styled(
+            "  Tracing row lineage (ancestors + descendants)...",
+            Style::default().fg(theme.accent),
+        ));
+        f.render_widget(body, layout[0]);
+        f.render_widget(
+            Paragraph::new("  loading…").style(Style::default().fg(theme.text_secondary)),
+            layout[1],
+        );
+        return;
     }
 
-    let body = Paragraph::new(lines).scroll((state.trace_scroll as u16, 0));
-    f.render_widget(body, layout[0]);
+    if let Some(ref err) = state.trace_error {
+        let body = Paragraph::new(Span::styled(
+            format!("  Trace failed: {}", err),
+            Style::default().fg(theme.danger),
+        ));
+        f.render_widget(body, layout[0]);
+        f.render_widget(
+            Paragraph::new("  [t]/Esc close").style(Style::default().fg(theme.text_secondary)),
+            layout[1],
+        );
+        return;
+    }
 
-    let footer = format!(
-        "  ▲ parents · ▼ children · {}  |  [j] tree/json  ·  ↑↓ PgUp/PgDn scroll  ·  [t]/Esc close",
-        footer_info
+    let Some(root) = state.trace_root.clone() else {
+        let body = Paragraph::new(Span::styled(
+            "  No trace loaded. Select a row and press [t].",
+            Style::default().fg(theme.text_secondary),
+        ));
+        f.render_widget(body, layout[0]);
+        return;
+    };
+
+    if state.trace_json_mode {
+        let json = serde_json::to_string_pretty(&root.to_json())
+            .unwrap_or_else(|e| format!("JSON error: {}", e));
+        let lines: Vec<Line> = json.lines().map(|l| render_trace_json_line(l, theme)).collect();
+        state.trace_line_count = lines.len();
+        let visible = layout[0].height as usize;
+        let max_scroll = lines.len().saturating_sub(visible);
+        if state.trace_scroll > max_scroll {
+            state.trace_scroll = max_scroll;
+        }
+        f.render_widget(
+            Paragraph::new(lines).scroll((state.trace_scroll as u16, 0)),
+            layout[0],
+        );
+        f.render_widget(
+            Paragraph::new(format!(
+                "  {} nodes  |  [j] tree  ·  ↑↓ scroll  ·  [t]/Esc close",
+                root.node_count()
+            ))
+            .style(Style::default().fg(theme.text_secondary)),
+            layout[1],
+        );
+        return;
+    }
+
+    // Dual pane: Ascendencia | Descendencia
+    use crate::lineage::{render_trace_lines, LineagePane};
+
+    let panes = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(layout[0]);
+
+    let anc_lines = render_trace_lines(&root, LineagePane::Ancestors);
+    let desc_lines = render_trace_lines(&root, LineagePane::Descendants);
+
+    let anc_styled: Vec<Line> = anc_lines
+        .iter()
+        .map(|s| style_lineage_line(s, theme, true))
+        .collect();
+    let desc_styled: Vec<Line> = desc_lines
+        .iter()
+        .map(|s| style_lineage_line(s, theme, false))
+        .collect();
+
+    let anc_focus = state.trace_focus_ancestors;
+    let anc_block = get_pane_block(" Ascendencia ▲ ", anc_focus, theme);
+    let desc_block = get_pane_block(" Descendencia ▼ ", !anc_focus, theme);
+
+    let anc_inner = anc_block.inner(panes[0]);
+    let desc_inner = desc_block.inner(panes[1]);
+    f.render_widget(anc_block, panes[0]);
+    f.render_widget(desc_block, panes[1]);
+
+    let anc_vis = anc_inner.height as usize;
+    let desc_vis = desc_inner.height as usize;
+    let anc_max = anc_lines.len().saturating_sub(anc_vis);
+    let desc_max = desc_lines.len().saturating_sub(desc_vis);
+    if state.trace_scroll > anc_max {
+        state.trace_scroll = anc_max;
+    }
+    if state.trace_scroll_desc > desc_max {
+        state.trace_scroll_desc = desc_max;
+    }
+    state.trace_line_count = if anc_focus {
+        anc_lines.len()
+    } else {
+        desc_lines.len()
+    };
+
+    f.render_widget(
+        Paragraph::new(anc_styled).scroll((state.trace_scroll as u16, 0)),
+        anc_inner,
     );
     f.render_widget(
-        Paragraph::new(footer).style(Style::default().fg(theme.border_inactive)),
+        Paragraph::new(desc_styled).scroll((state.trace_scroll_desc as u16, 0)),
+        desc_inner,
+    );
+
+    let focus_hint = if anc_focus { "▲ ancestors" } else { "▼ descendants" };
+    f.render_widget(
+        Paragraph::new(format!(
+            "  {} · {} nodes  |  [Tab] pane  ·  [j] json  ·  ↑↓ scroll  ·  [t]/Esc close",
+            focus_hint,
+            root.node_count()
+        ))
+        .style(Style::default().fg(theme.text_secondary)),
         layout[1],
     );
 }
 
-/// One line per node: branch guides + direction glyph + table + row summary,
-/// with the FK that led there rendered dimmed underneath-in-line.
+fn style_lineage_line(raw: &str, theme: &Theme, is_ancestor_side: bool) -> Line<'static> {
+    let color = if raw.contains('●') {
+        theme.header_fg
+    } else if raw.contains('▲') {
+        theme.accent
+    } else if raw.contains('▼') {
+        theme.success
+    } else if is_ancestor_side {
+        theme.text_primary
+    } else {
+        theme.text_primary
+    };
+    Line::from(Span::styled(raw.to_string(), Style::default().fg(color)))
+}
+
+/// One line per node: branch guides + direction glyph + table + row summary.
+#[allow(dead_code)]
 fn render_trace_node(
     node: &crate::db::TraceNode,
     prefix: &str,
@@ -570,9 +650,9 @@ fn draw_connection_screen(f: &mut Frame, area: Rect, state: &mut AppState, theme
     // Draw Modes Tabs
     let mode_tabs_titles = vec!["[F2] Discovered Profiles", "[F3] Manual Form", "[F4] Raw URL"];
     let active_mode_idx = match state.connection_mode {
-        crate::app::ConnectionMode::Profiles => 0,
-        crate::app::ConnectionMode::Form => 1,
-        crate::app::ConnectionMode::RawUrl => 2,
+        crate::tui::state::ConnectionMode::Profiles => 0,
+        crate::tui::state::ConnectionMode::Form => 1,
+        crate::tui::state::ConnectionMode::RawUrl => 2,
     };
     let mode_tabs = ratatui::widgets::Tabs::new(mode_tabs_titles)
         .block(Block::default().borders(Borders::BOTTOM).border_style(Style::default().fg(theme.border_inactive)))
@@ -584,9 +664,9 @@ fn draw_connection_screen(f: &mut Frame, area: Rect, state: &mut AppState, theme
     // Draw Mode Content
     let content_area = right_splits[1];
     match state.connection_mode {
-        crate::app::ConnectionMode::Profiles => {
+        crate::tui::state::ConnectionMode::Profiles => {
             // Filter profiles matching current active engine
-            let filtered_profiles: Vec<(usize, &crate::app::ConnectionProfile)> = state.profiles
+            let filtered_profiles: Vec<(usize, &crate::tui::state::ConnectionProfile)> = state.profiles
                 .iter()
                 .enumerate()
                 .filter(|(_, p)| p.engine == state.active_engine)
@@ -614,7 +694,7 @@ fn draw_connection_screen(f: &mut Frame, area: Rect, state: &mut AppState, theme
                 f.render_widget(profiles_list, content_area);
             }
         }
-        crate::app::ConnectionMode::Form => {
+        crate::tui::state::ConnectionMode::Form => {
             // Form has 5 input fields
             let form_layout = Layout::default()
                 .direction(Direction::Vertical)
@@ -628,11 +708,11 @@ fn draw_connection_screen(f: &mut Frame, area: Rect, state: &mut AppState, theme
                 .split(content_area);
 
             let fields = [
-                (crate::app::FormField::Host, &state.form_fields.host),
-                (crate::app::FormField::Port, &state.form_fields.port),
-                (crate::app::FormField::User, &state.form_fields.user),
-                (crate::app::FormField::Pass, &state.form_fields.pass),
-                (crate::app::FormField::Db, &state.form_fields.db_or_path),
+                (crate::tui::state::FormField::Host, &state.form_fields.host),
+                (crate::tui::state::FormField::Port, &state.form_fields.port),
+                (crate::tui::state::FormField::User, &state.form_fields.user),
+                (crate::tui::state::FormField::Pass, &state.form_fields.pass),
+                (crate::tui::state::FormField::Db, &state.form_fields.db_or_path),
             ];
 
             for (idx, (field, value)) in fields.iter().enumerate() {
@@ -644,7 +724,7 @@ fn draw_connection_screen(f: &mut Frame, area: Rect, state: &mut AppState, theme
                 };
 
                 let label_text = format!(" {} ", field.label(state.active_engine));
-                let value_display = if *field == crate::app::FormField::Pass {
+                let value_display = if *field == crate::tui::state::FormField::Pass {
                     "*".repeat(value.len())
                 } else {
                     (*value).clone()
@@ -671,7 +751,7 @@ fn draw_connection_screen(f: &mut Frame, area: Rect, state: &mut AppState, theme
                 }
             }
         }
-        crate::app::ConnectionMode::RawUrl => {
+        crate::tui::state::ConnectionMode::RawUrl => {
             let conn_val = match state.active_engine {
                 ActiveEngine::MariaDb => &state.conn_fields.mysql_url,
                 ActiveEngine::PostgreSql => &state.conn_fields.postgres_url,
@@ -764,8 +844,8 @@ fn draw_header_tabs(f: &mut Frame, area: Rect, state: &mut AppState, theme: &The
     f.render_widget(tabs, area);
 }
 
-/// A horizontal row of clickable action buttons. Each button registers its
-/// rect in `state.toolbar_buttons` so `handle_mouse_click` can dispatch it.
+/// Lazy* hotkey legend — no solid filled buttons. Key in accent, label dim.
+/// Click hit-rects still registered for mouse dispatch.
 fn draw_action_toolbar(f: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) {
     state.toolbar_buttons.clear();
 
@@ -797,35 +877,53 @@ fn draw_action_toolbar(f: &mut Frame, area: Rect, state: &mut AppState, theme: &
     let mut spans: Vec<Span> = Vec::new();
     let mut x = area.x;
     for action in actions {
-        let text = format!(" {} {} ", action.label(), action.shortcut());
-        let w = text.chars().count() as u16;
-        if x + w + 1 >= area.x + area.width {
-            break; // ran out of horizontal space
-        }
-
-        // Danger actions get a red button; the chart toggle lights up when on.
-        let (bg, fg) = match action {
-            ToolbarAction::Delete | ToolbarAction::Disconnect => (theme.danger, Color::Black),
-            ToolbarAction::ToggleChart if state.bi_mode_enabled => (theme.success, Color::Black),
-            ToolbarAction::Back => (theme.header_fg, Color::Black),
-            _ => (theme.accent, Color::Black),
+        let key = action.shortcut();
+        let label = match action {
+            ToolbarAction::Search => "search",
+            ToolbarAction::Describe => "describe",
+            ToolbarAction::Trace => "trace",
+            ToolbarAction::Edit => "edit",
+            ToolbarAction::Add => "add",
+            ToolbarAction::Delete => "delete",
+            ToolbarAction::Refresh => "refresh",
+            ToolbarAction::ToggleChart => {
+                if state.bi_mode_enabled {
+                    "chart*"
+                } else {
+                    "chart"
+                }
+            }
+            ToolbarAction::ToggleRelated => "related",
+            ToolbarAction::Databases => "dbs",
+            ToolbarAction::Back => "back",
+            ToolbarAction::Disconnect => "quit",
         };
+        let key_color = match action {
+            ToolbarAction::Delete | ToolbarAction::Disconnect => theme.danger,
+            ToolbarAction::ToggleChart if state.bi_mode_enabled => theme.success,
+            ToolbarAction::Trace => theme.header_fg,
+            _ => theme.accent,
+        };
+        let chunk = format!("[{}]{} ", key, label);
+        let w = chunk.chars().count() as u16;
+        if x + w > area.x + area.width {
+            break;
+        }
         spans.push(Span::styled(
-            text,
-            Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD),
+            format!("[{}]", key),
+            Style::default().fg(key_color).add_modifier(Modifier::BOLD),
         ));
-        spans.push(Span::raw(" "));
-
+        spans.push(Span::styled(
+            format!("{} ", label),
+            Style::default().fg(theme.text_secondary),
+        ));
         state
             .toolbar_buttons
             .push((Rect { x, y: area.y, width: w, height: 1 }, action));
-        x += w + 1;
+        x += w;
     }
 
-    f.render_widget(
-        Paragraph::new(Line::from(spans)).style(Style::default().bg(Color::Rgb(30, 31, 43))),
-        area,
-    );
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn draw_workspace(f: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) {
@@ -1645,35 +1743,41 @@ fn draw_footer_status(f: &mut Frame, area: Rect, state: &mut AppState, theme: &T
     let status_widget = Paragraph::new(active_db_indicator).style(status_style);
     f.render_widget(status_widget, bar_layout[0]);
 
-    // Right keyboard hotkeys legend — contextual to the focused pane.
+    // Right keyboard hotkeys legend — contextual to the focused pane (lazy* style).
     let shortcut_text = if state.search_active {
-        "type to filter · Enter: keep · Esc: clear".to_string()
+        "[type] filter  [Enter] keep  [Esc] clear".to_string()
     } else {
         match state.active_pane {
             ActivePane::Sidebar => {
-                "↑↓: Move · Enter: Open · d: DBs · Tab: Next pane · Ctrl+Q: Quit".to_string()
+                "[↑↓] move  [Enter] open  [d] dbs  [Tab] pane  [q] quit".to_string()
             }
             ActivePane::SqlConsole => {
-                "type query · Enter: Run · Esc: Back · Tab: Next pane".to_string()
+                "[type] query  [Enter] run  [Esc] back  [Tab] pane".to_string()
             }
             ActivePane::QueryResults => {
-                let mut s = String::from("↑↓: Rows · ◀▶: Cols · /: Search · i: Describe · e/a/d: Edit/Add/Del");
+                let mut s = String::from(
+                    "[↑↓] rows  [←→] cols  [/] search  [i] describe  [t] trace  [e/a/d] edit",
+                );
                 if state.bi_chartable {
-                    s.push_str(" · F6: BI");
+                    s.push_str("  [F6] bi");
                 }
                 if !state.exploration_history.is_empty() {
-                    s = format!("Backspace: Back · {}", s);
+                    s = format!("[⌫] back  {}", s);
                 }
                 s
             }
             ActivePane::RelatedDataList => {
-                "↑↓: Joins · Enter/▶: Open · Backspace: Back · Esc: Grid".to_string()
+                "[↑↓] joins  [Enter] open  [⌫] back  [Esc] grid".to_string()
             }
             ActivePane::RelatedDataGrid => {
-                "↑↓: Rows · Enter/G: Descend · Backspace: Back · ◀▶: Cols".to_string()
+                "[↑↓] rows  [Enter] descend  [⌫] back  [←→] cols".to_string()
             }
-            ActivePane::ModalEditor => "↑↓: Field · type value · Enter: Save · Esc: Cancel".to_string(),
-            ActivePane::EngineSelector => "F2/F3/F4: Mode · ◀▶: Engine · Enter: Connect".to_string(),
+            ActivePane::ModalEditor => {
+                "[↑↓] field  [type] value  [Enter] save  [Esc] cancel".to_string()
+            }
+            ActivePane::EngineSelector => {
+                "[F2/F3/F4] mode  [←→] engine  [Enter] connect".to_string()
+            }
         }
     };
     let legend = Paragraph::new(shortcut_text)

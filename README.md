@@ -34,15 +34,25 @@ La interfaz nunca se bloquea esperando a la base de datos: una tarea worker
 es dueña de cada conexión y se comunica con la interfaz por canales. El mismo
 worker atiende al TUI y a la CLI headless.
 
+Layout modular (TEA):
+
+```
+src/main.rs          → router TUI | CLI
+src/cli/             → arbol / trace (clap)
+src/tui/             → event loop + state + view + update
+src/db/              → DbWorker + drivers
+src/lineage/         → render dual Ascendencia/Descendencia
+```
+
 ```mermaid
 flowchart LR
     subgraph Interfaz
-        TUI[Bucle de eventos del TUI - main.rs / ui.rs]
-        CLI[CLI headless - headless.rs]
+        TUI[TUI TEA - tui/]
+        CLI[CLI arbol/trace - cli/]
     end
-    subgraph Worker["DbWorker (db/mod.rs)"]
+    subgraph Worker["DbWorker (db/)"]
         DISPATCH[Despacho de solicitudes]
-        WALK[Recorredores de linaje: FKs relacionales, convenciones Mongo, aristas Neo4j]
+        WALK[Recorredores de linaje]
     end
     subgraph Motores
         MY[(MariaDB/MySQL)]
@@ -158,19 +168,28 @@ conexión directa. El motor se elige con Izquierda/Derecha.
 
 ## Trazado headless (scripts y agentes de IA)
 
+Comando preferido para agentes y scripts — árbol dual (ascendencia / descendencia):
+
+```bash
+linajedb arbol mysql://usuario:clave@host:3306/tienda \
+    ordenes "id_orden=118"
+
+linajedb arbol mongodb://localhost:27017/app \
+    usuarios '{"correo": "ana@ejemplo.com"}' --format json
+
+linajedb arbol bolt://neo4j:clave@localhost:7687 \
+    Persona "nombre=Alicia"
+```
+
+Alias legacy con flags (mismo motor):
+
 ```bash
 linajedb trace --url mysql://usuario:clave@host:3306/tienda \
     --table ordenes --where "id_orden=118" --format tree
-
-linajedb trace --url mongodb://localhost:27017/app \
-    --table usuarios --where '{"correo": "ana@ejemplo.com"}'    # salida JSON
-
-linajedb trace --url bolt://neo4j:clave@localhost:7687 \
-    --table Persona --where "nombre=Alicia"
 ```
 
-El JSON se escribe a stdout (se puede canalizar a `jq` o entregar a un modelo
-de lenguaje); los errores van a stderr con código de salida 1.
+`arbol` imprime por defecto el árbol en texto (secciones ASCENDENCIA / DESCENDENCIA).
+Usa `--format json` para piping a `jq` o a un modelo. Errores → stderr + exit 1.
 
 Resolución del linaje según el motor:
 

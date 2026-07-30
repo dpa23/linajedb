@@ -1,6 +1,11 @@
 use crate::db::{DbEngineConfig, DbResponse, RelationshipInfo, DbRequest};
-use crate::ui::BiBarData;
 use serde_json::Value;
+
+#[derive(Debug, Clone)]
+pub struct BiBarData {
+    pub label: String,
+    pub value: u64,
+}
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
@@ -138,6 +143,7 @@ pub enum ToolbarAction {
 
 impl ToolbarAction {
     /// (icon+label shown on the button, the keyboard shortcut hint).
+    #[allow(dead_code)]
     pub fn label(&self) -> &'static str {
         match self {
             ToolbarAction::Search => "⌕ Search",
@@ -372,6 +378,9 @@ pub struct AppState {
     pub trace_json_mode: bool, // false = tree view, true = raw JSON view
     pub trace_scroll: usize,
     pub trace_line_count: usize, // set by the UI each frame, used to clamp scroll
+    /// true = focus Ascendencia pane; false = Descendencia (dual-pane tree view)
+    pub trace_focus_ancestors: bool,
+    pub trace_scroll_desc: usize, // independent scroll for descendants pane
 
     // Interactive Modal Row Editors
     pub show_edit_modal: bool,
@@ -514,6 +523,8 @@ impl AppState {
             trace_json_mode: false,
             trace_scroll: 0,
             trace_line_count: 0,
+            trace_focus_ancestors: true,
+            trace_scroll_desc: 0,
             show_edit_modal: false,
             show_add_modal: false,
             show_delete_confirm: false,
@@ -1878,6 +1889,8 @@ impl AppState {
         self.trace_error = None;
         self.trace_json_mode = false;
         self.trace_scroll = 0;
+        self.trace_focus_ancestors = true;
+        self.trace_scroll_desc = 0;
         Some(DbRequest::TraceRow {
             table,
             columns: self.result_headers.clone(),
@@ -1891,6 +1904,7 @@ impl AppState {
         self.trace_root = None;
         self.trace_error = None;
         self.trace_scroll = 0;
+        self.trace_scroll_desc = 0;
     }
 
     /// Run a toolbar action (shared by mouse clicks and keyboard shortcuts).
